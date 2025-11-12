@@ -1,0 +1,9 @@
+fyers_apiv3
+pyotp
+requests
+pytz
+pandas
+flask
+numpy
+setuptools
+py_vollib

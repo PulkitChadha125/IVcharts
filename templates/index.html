@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IV Charts - Implied Volatility Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+    <div class="container">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="logo">
+                <h1>IV Charts</h1>
+            </div>
+            <nav class="nav-menu">
+                <a href="#" class="nav-item active">Dashboard</a>
+            </nav>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Header -->
+            <header class="header">
+                <div class="header-left">
+                    <h2>Dashboard</h2>
+                </div>
+                <div class="header-right">
+                    <button id="loginBtn" class="btn-primary" onclick="loginToAPI()">Login to API</button>
+                    <div class="user-profile">
+                        <div class="profile-icon">👤</div>
+                    </div>
+                </div>
+            </header>
+
+            <!-- Login Status -->
+            <div id="loginStatus" class="status-card" style="display: none;">
+                <span class="status-indicator"></span>
+                <span id="statusText">Logged in</span>
+            </div>
+
+            <!-- Settings Section -->
+            <div id="settingsSection" class="settings-section" style="display: none;">
+                <div class="settings-card">
+                    <h3>Settings</h3>
+                    <div class="settings-row">
+                        <div class="input-group">
+                            <label for="symbol">Symbol</label>
+                            <input type="text" id="symbol" placeholder="e.g., NSE:RELIANCE-EQ or Option Symbol" value="NSE:RELIANCE-EQ">
+                        </div>
+                        <div class="input-group">
+                            <label for="timeframe">Timeframe</label>
+                            <select id="timeframe">
+                                <option value="1">1 Minute</option>
+                                <option value="5">5 Minutes</option>
+                                <option value="15">15 Minutes</option>
+                                <option value="30">30 Minutes</option>
+                                <option value="60">1 Hour</option>
+                                <option value="1D" selected>1 Day</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="settings-row">
+                        <div class="input-group">
+                            <label for="strike">Strike Price (Optional)</label>
+                            <input type="number" id="strike" placeholder="e.g., 18257" step="0.01">
+                        </div>
+                        <div class="input-group">
+                            <label for="expiry">Expiry Date & Time (Optional)</label>
+                            <input type="datetime-local" id="expiry">
+                        </div>
+                        <div class="input-group">
+                            <label for="optionType">Option Type (Optional)</label>
+                            <select id="optionType">
+                                <option value="">Auto-detect</option>
+                                <option value="c">Call (CE)</option>
+                                <option value="p">Put (PE)</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="settings-row">
+                        <div class="button-group">
+                            <button id="startBtn" class="btn-success" onclick="startFetching()">Start Fetching</button>
+                            <button id="stopBtn" class="btn-danger" onclick="stopFetching()">Stop Fetching</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Chart Section -->
+            <div class="chart-section">
+                <div class="chart-card">
+                    <div class="chart-header">
+                        <h3>Implied Volatility Chart</h3>
+                        <div class="chart-controls">
+                            <span id="fetchStatus" class="status-badge">Stopped</span>
+                            <button id="resetZoomBtn" class="btn-reset" title="Reset Zoom (Double-click chart)">Reset Zoom</button>
+                        </div>
+                    </div>
+                    <div class="chart-hint">
+                        <small>💡 Scroll to zoom | Click and drag to pan | Double-click to reset | Mouse wheel on price scale to zoom Y-axis</small>
+                    </div>
+                    <div class="chart-container">
+                        <div id="ivChart"></div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/tradingview-chart.js') }}"></script>
+</body>
+</html>
+
