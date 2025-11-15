@@ -804,7 +804,7 @@ def fetch_data_loop_automatic(future_symbol, expiry_date, expiry_type, option_ty
     2. Calculate ATM strike
     3. Generate option symbol
     4. Fetch option data and calculate IV
-    5. Repeat every 1 minute
+    5. Repeat every 1 second
     """
     global iv_data_store, fetching_status
     
@@ -868,25 +868,19 @@ def fetch_data_loop_automatic(future_symbol, expiry_date, expiry_type, option_ty
             # Get future LTP
             future_ltp = get_future_ltp(future_symbol)
             if future_ltp is None:
-                print(f"Could not fetch LTP for {future_symbol}. Retrying in 60 seconds...")
-                time.sleep(60)
+                print(f"Could not fetch LTP for {future_symbol}. Retrying in 5 seconds...")
+                time.sleep(5)
                 continue
             
             print(f"Future LTP: {future_ltp}")
             
             # Calculate ATM strike
-            # Strike distance: 50 for NIFTY and MCX (Crude Oil), 100 for BANKNIFTY
-            if is_mcx:
-                strike_distance = 50  # MCX contracts (Crude Oil) use 50
-            elif 'BANK' in underlying:
-                strike_distance = 100  # BANKNIFTY uses 100
-            else:
-                strike_distance = 50  # NIFTY uses 50
-            
+            # Use the strike_distance passed to the function (from user input or defaults)
+            # strike_distance is already set from the function parameter, no need to recalculate
             atm_strike = calculate_atm_strike(future_ltp, strike_distance)
             if atm_strike is None:
-                print(f"Could not calculate ATM strike. Retrying in 60 seconds...")
-                time.sleep(60)
+                print(f"Could not calculate ATM strike. Retrying in 5 seconds...")
+                time.sleep(5)
                 continue
             
             print(f"ATM Strike: {atm_strike}")
@@ -894,8 +888,8 @@ def fetch_data_loop_automatic(future_symbol, expiry_date, expiry_type, option_ty
             # Generate option symbol (with MCX: prefix for MCX contracts)
             symbol = generate_option_symbol(underlying, expiry_date, atm_strike, option_type, expiry_type, is_mcx=is_mcx)
             if not symbol:
-                print(f"Could not generate option symbol. Retrying in 60 seconds...")
-                time.sleep(60)
+                print(f"Could not generate option symbol. Retrying in 5 seconds...")
+                time.sleep(5)
                 continue
             
             print(f"Generated Option Symbol: {symbol}")
@@ -908,8 +902,8 @@ def fetch_data_loop_automatic(future_symbol, expiry_date, expiry_type, option_ty
             df = safe_fetch_ohlc(symbol, timeframe)
             
             if df is None or len(df) == 0:
-                print(f"Failed to fetch data for {symbol}. Retrying in 60 seconds...")
-                time.sleep(60)
+                print(f"Failed to fetch data for {symbol}. Retrying in 5 seconds...")
+                time.sleep(5)
                 continue
             
             # Calculate IV
@@ -955,15 +949,15 @@ def fetch_data_loop_automatic(future_symbol, expiry_date, expiry_type, option_ty
             else:
                 print(f"Warning: Could not calculate IV for {symbol}")
             
-            # Wait 60 seconds before next iteration
-            print(f"Waiting 60 seconds before next update...")
-            time.sleep(60)
+            # Wait 1 second before next iteration
+            print(f"Waiting 1 second before next update...")
+            time.sleep(1)
             
         except Exception as e:
             print(f"Error in automatic fetch loop: {e}")
             import traceback
             traceback.print_exc()
-            time.sleep(60)  # Wait before retrying
+            time.sleep(5)  # Wait before retrying on error
 
 def fetch_data_loop(symbol, timeframe, manual_strike=None, manual_expiry=None, manual_option_type=None, risk_free_rate=0.1):
     """Continuously fetch historical data and calculate IV"""
@@ -1039,13 +1033,13 @@ def fetch_data_loop(symbol, timeframe, manual_strike=None, manual_expiry=None, m
                 print(f"No data received for {symbol}. Retrying...")
             
             # Wait before next fetch (adjust interval as needed)
-            time.sleep(5)  # Fetch every 5 seconds
+            time.sleep(1)  # Fetch every 1 second
             
         except Exception as e:
             print(f"Unexpected error in fetch loop: {e}")
             import traceback
             traceback.print_exc()
-            time.sleep(5)
+            time.sleep(1)  # Wait 1 second before retrying on error
 
 @app.route('/')
 def index():
@@ -1164,13 +1158,15 @@ def start_fetching():
         fetching_status["active"] = False
         time.sleep(1)  # Wait for thread to stop
     
-    # Clear old data: delete all CSV files and clear iv_data_store
+    # Clear old data: delete previous symbol's CSV file and clear iv_data_store
     print("Clearing old data before starting new fetch...")
-    deleted_count = delete_csv_files()  # Delete all CSV files
-    if old_symbol and old_symbol in iv_data_store:
-        del iv_data_store[old_symbol]
-        print(f"Cleared IV data store for old symbol: {old_symbol}")
-    # Also clear any other symbols in the store
+    if old_symbol:
+        deleted_count = delete_csv_files(old_symbol)  # Delete old symbol's CSV file
+        if old_symbol in iv_data_store:
+            del iv_data_store[old_symbol]
+            print(f"Cleared IV data store for old symbol: {old_symbol}")
+    
+    # Clear any other symbols in the store
     iv_data_store.clear()
     print("Cleared all IV data from memory")
     
@@ -1248,13 +1244,23 @@ def start_fetching():
             return jsonify({"success": False, "message": f"Could not fetch LTP for {future_symbol}"}), 400
         
         # Calculate ATM strike
-        # Strike distance: 50 for NIFTY and MCX (Crude Oil), 100 for BANKNIFTY
-        if is_mcx:
-            strike_distance = 50  # MCX contracts (Crude Oil) use 50
-        elif 'BANK' in underlying:
-            strike_distance = 100  # BANKNIFTY uses 100
+        # Get strike_step from request, or use defaults based on symbol type
+        strike_step = data.get('strike_step')
+        if strike_step is not None:
+            try:
+                strike_distance = float(strike_step)
+                if strike_distance <= 0:
+                    return jsonify({"success": False, "message": "Strike step must be greater than 0"}), 400
+            except (ValueError, TypeError):
+                return jsonify({"success": False, "message": "Invalid strike step format"}), 400
         else:
-            strike_distance = 50  # NIFTY uses 50
+            # Default strike distance: 50 for NIFTY and MCX (Crude Oil), 100 for BANKNIFTY
+            if is_mcx:
+                strike_distance = 50  # MCX contracts (Crude Oil) use 50
+            elif 'BANK' in underlying:
+                strike_distance = 100  # BANKNIFTY uses 100
+            else:
+                strike_distance = 50  # NIFTY uses 50
         
         atm_strike = calculate_atm_strike(future_ltp, strike_distance)
         
@@ -1268,6 +1274,11 @@ def start_fetching():
             return jsonify({"success": False, "message": "Could not generate option symbol"}), 400
         
         print(f"Automatic mode: Generated option symbol {symbol} from future {future_symbol} (LTP: {future_ltp}, ATM Strike: {atm_strike})")
+        
+        # Delete new symbol's CSV file to ensure fresh data
+        if symbol and symbol != old_symbol:
+            delete_csv_files(symbol)
+            print(f"Deleted CSV file for new symbol: {symbol}")
         
         # Start new fetching with generated symbol
         fetching_status = {
@@ -1285,6 +1296,7 @@ def start_fetching():
         
         # Start fetching in background thread with automatic mode
         # Note: strike_distance is calculated above and passed to the thread
+        # Pass strike_step (or None) so the loop can use it or calculate defaults
         thread = threading.Thread(target=fetch_data_loop_automatic, args=(future_symbol, expiry_date, expiry_type, option_type, timeframe, strike_distance, risk_free_rate), daemon=True)
         thread.start()
         
@@ -1293,7 +1305,8 @@ def start_fetching():
             "message": "Automatic data fetching started",
             "generated_symbol": symbol,
             "future_ltp": future_ltp,
-            "atm_strike": atm_strike
+            "atm_strike": atm_strike,
+            "strike_step": strike_distance
         })
     
     else:
@@ -1305,6 +1318,11 @@ def start_fetching():
         
         if not symbol:
             return jsonify({"success": False, "message": "Symbol is required for manual mode"}), 400
+        
+        # Delete new symbol's CSV file to ensure fresh data
+        if symbol and symbol != old_symbol:
+            delete_csv_files(symbol)
+            print(f"Deleted CSV file for new symbol: {symbol}")
         
         # Start new fetching with optional parameters
         fetching_status = {

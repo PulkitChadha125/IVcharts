@@ -707,6 +707,8 @@ async function startFetching() {
         const expiryType = expiryTypeInput.value;
         const expiryDate = autoExpiryDateInput.value;
         const optionType = autoOptionTypeInput.value;
+        const strikeStepInput = document.getElementById('strikeStep');
+        const strikeStep = strikeStepInput && strikeStepInput.value ? parseFloat(strikeStepInput.value) : null;
         
         if (!futureSymbol) {
             showNotification('Please enter a future symbol', 'error');
@@ -722,6 +724,9 @@ async function startFetching() {
         payload.expiry_type = expiryType;
         payload.expiry_date = expiryDate;
         payload.option_type = optionType;
+        if (strikeStep !== null && strikeStep > 0) {
+            payload.strike_step = strikeStep;
+        }
         
         console.log('Automatic mode parameters:', payload);
     } else {
@@ -789,7 +794,8 @@ async function startFetching() {
             
             let message = 'Data fetching started';
             if (mode === 'automatic' && data.generated_symbol) {
-                message = `Automatic mode started. Generated symbol: ${data.generated_symbol} (Future LTP: ${data.future_ltp}, ATM Strike: ${data.atm_strike})`;
+                const strikeStepInfo = data.strike_step ? `, Strike Step: ${data.strike_step}` : '';
+                message = `Automatic mode started. Generated symbol: ${data.generated_symbol} (Future LTP: ${data.future_ltp}, ATM Strike: ${data.atm_strike}${strikeStepInfo})`;
             }
             showNotification(message, 'success');
             
@@ -869,8 +875,8 @@ function startPollingIVData(symbol) {
     // Fetch immediately
     fetchIVData(symbol);
     
-    // Then poll every 2 seconds
-    // In automatic mode, get the current symbol from status (updated every minute)
+    // Then poll every 1 second
+    // In automatic mode, get the current symbol from status (updated every second)
     fetchInterval = setInterval(async () => {
         try {
             // Check if we're in automatic mode and get current symbol from status
@@ -878,7 +884,7 @@ function startPollingIVData(symbol) {
             if (statusResponse.ok) {
                 const status = await statusResponse.json();
                 if (status.active && status.mode === 'automatic' && status.symbol) {
-                    // Use the current symbol from status (updated every minute in automatic mode)
+                    // Use the current symbol from status (updated every second in automatic mode)
                     // Update chart title if symbol changed
                     updateChartTitle(status.symbol);
                     fetchIVData(status.symbol);
@@ -901,9 +907,9 @@ function startPollingIVData(symbol) {
             fetchIVData(symbol);
         }
         checkFetchStatus();
-    }, 2000);
+    }, 1000);
     
-    console.log('Polling started - fetching IV data every 2 seconds');
+    console.log('Polling started - fetching IV data every 1 second');
 }
 
 // Check fetching status periodically
