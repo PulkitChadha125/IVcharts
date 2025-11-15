@@ -117,6 +117,10 @@ def automated_login(client_id,secret_key,FY_ID,TOTP_KEY,PIN,redirect_uri):
     session.set_token(auth_code)
     response = session.generate_token()
     
+    # Debug: Print the actual response structure
+    print(f"generate_token() response type: {type(response)}")
+    print(f"generate_token() response: {response}")
+    
     # Check if response is valid and contains access_token
     if not response:
         raise Exception("generate_token() returned None or empty response")
@@ -132,6 +136,7 @@ def automated_login(client_id,secret_key,FY_ID,TOTP_KEY,PIN,redirect_uri):
         else:
             # Print the actual response structure for debugging
             print(f"Unexpected response structure from generate_token(): {response}")
+            print(f"Response keys: {list(response.keys()) if isinstance(response, dict) else 'not a dict'}")
             raise KeyError(f"access_token not found in response. Response keys: {list(response.keys()) if isinstance(response, dict) else 'not a dict'}")
     else:
         raise Exception(f"Unexpected response type from generate_token(): {type(response)}")

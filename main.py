@@ -11,9 +11,9 @@ import FyresIntegration
 import threading
 import time
 
-# Import py_vollib for Black-Scholes IV calculation
+# Import py_vollib for Black model IV calculation (for options on futures)
 try:
-    from py_vollib.black_scholes.implied_volatility import implied_volatility
+    from py_vollib.black.implied_volatility import implied_volatility
     PY_VOLLIB_AVAILABLE = True
 except ImportError:
     PY_VOLLIB_AVAILABLE = False
@@ -31,6 +31,46 @@ DATA_FOLDER = 'data'
 if not os.path.exists(DATA_FOLDER):
     os.makedirs(DATA_FOLDER)
     print(f"Created data folder: {DATA_FOLDER}")
+
+def delete_csv_files(symbol=None):
+    """
+    Delete CSV files from data folder
+    If symbol is provided, delete only that symbol's CSV file
+    If symbol is None, delete all CSV files
+    """
+    try:
+        if not os.path.exists(DATA_FOLDER):
+            return 0
+        
+        deleted_count = 0
+        if symbol:
+            # Delete specific symbol's CSV file
+            safe_symbol = re.sub(r'[<>:"/\\|?*]', '_', symbol)
+            safe_symbol = safe_symbol.replace(':', '_').replace(' ', '_')
+            filename = os.path.join(DATA_FOLDER, f"{safe_symbol}.csv")
+            if os.path.exists(filename):
+                os.remove(filename)
+                print(f"Deleted CSV file for symbol {symbol}: {filename}")
+                deleted_count = 1
+        else:
+            # Delete all CSV files
+            csv_files = [f for f in os.listdir(DATA_FOLDER) if f.endswith('.csv')]
+            for csv_file in csv_files:
+                filepath = os.path.join(DATA_FOLDER, csv_file)
+                try:
+                    os.remove(filepath)
+                    deleted_count += 1
+                    print(f"Deleted CSV file: {filepath}")
+                except Exception as e:
+                    print(f"Error deleting {filepath}: {e}")
+        
+        print(f"Deleted {deleted_count} CSV file(s)")
+        return deleted_count
+    except Exception as e:
+        print(f"Error deleting CSV files: {e}")
+        import traceback
+        traceback.print_exc()
+        return 0
 
 def load_credentials():
     """Load Fyers credentials from CSV file"""
@@ -130,11 +170,11 @@ def save_iv_to_csv(symbol, df_with_iv, timeframe=None, strike=None, expiry=None,
 
 def parse_option_symbol(symbol):
     """
-    Parse Indian option symbol format (e.g., NIFTY25N1825700PE, RELIANCE25N1825700CE)
+    Parse Indian option symbol format (e.g., NIFTY25N1825700PE, RELIANCE25N1825700CE, MCX:CRUDEOILM25NOV5300CE)
     Returns: dict with underlying, expiry_date, strike, option_type, or None if not an option
     """
     # Pattern for Indian options: SYMBOL + YY + M + STRIKE + CE/PE
-    # Example: NIFTY25N1825700PE, RELIANCE25DEC1825700CE
+    # Example: NIFTY25N1825700PE, RELIANCE25DEC1825700CE, MCX:CRUDEOILM25NOV5300CE
     
     # Check if it ends with CE or PE (Call/Put European)
     if not (symbol.endswith('CE') or symbol.endswith('PE')):
@@ -142,12 +182,20 @@ def parse_option_symbol(symbol):
     
     option_type = 'c' if symbol.endswith('CE') else 'p'
     
+    # Handle MCX symbols (MCX:COMMODITY...)
+    is_mcx = symbol.startswith('MCX:')
+    if is_mcx:
+        # Remove MCX: prefix for parsing
+        symbol_without_exchange = symbol[4:]  # Remove "MCX:"
+    else:
+        symbol_without_exchange = symbol
+    
     # Remove CE/PE suffix
-    base = symbol[:-2]
+    base = symbol_without_exchange[:-2]
     
     # Try to extract strike price (usually last 4-6 digits before CE/PE)
-    # Common formats: NIFTY25N1825700PE, NIFTY25DEC1825700PE
-    strike_match = re.search(r'(\d{4,6})(CE|PE)$', symbol)
+    # Common formats: NIFTY25N1825700PE, NIFTY25DEC1825700PE, MCX:CRUDEOILM25NOV5300CE
+    strike_match = re.search(r'(\d{4,6})(CE|PE)$', symbol_without_exchange)
     if strike_match:
         strike_str = strike_match.group(1)
         # Handle strike with decimals (e.g., 18257.00 -> 18257)
@@ -202,6 +250,9 @@ def parse_option_symbol(symbol):
         # Get underlying symbol (everything before year)
         underlying = base[:-len(year_str + month_code)]
         
+        # For MCX, keep the underlying as-is (e.g., CRUDEOILM)
+        # For NSE, underlying is already correct (e.g., NIFTY)
+        
         # For expiry, use last Thursday of the month (standard for NSE)
         # Simplified: use last day of month
         from calendar import monthrange
@@ -209,11 +260,12 @@ def parse_option_symbol(symbol):
         expiry_date = datetime(year, month, last_day, 15, 30, 0)  # 3:30 PM IST
         
         return {
-            'underlying': underlying,
+            'underlying': underlying,  # e.g., "CRUDEOILM" for MCX or "NIFTY" for NSE
             'expiry_date': expiry_date,
             'strike': strike,
             'option_type': option_type,
-            'is_option': True
+            'is_option': True,
+            'is_mcx': is_mcx  # Add flag to indicate MCX contract
         }
     
     return None
@@ -251,11 +303,16 @@ def get_underlying_price_from_fyers(underlying_symbol):
 def get_future_symbol(underlying, expiry_date):
     """
     Construct future symbol based on underlying and expiry date
-    For NIFTY -> NIFTY25NOVFUT
-    For BANKNIFTY -> BANKNIFTY25NOVFUT
+    For NIFTY -> NSE:NIFTY25NOVFUT
+    For BANKNIFTY -> NSE:BANKNIFTY25NOVFUT
+    For MCX contracts (e.g., CRUDEOILM) -> MCX:CRUDEOILM25NOVFUT
     """
     if not expiry_date:
         return None
+    
+    # Remove MCX: prefix if present (in case it was passed with prefix)
+    if underlying.startswith('MCX:'):
+        underlying = underlying[4:]
     
     # Extract year (last 2 digits) and month from expiry date
     year_2digit = expiry_date.strftime('%y')  # e.g., "25" for 2025
@@ -272,7 +329,26 @@ def get_future_symbol(underlying, expiry_date):
         # BANKNIFTY future: NSE:BANKNIFTY25NOVFUT
         future_symbol = f"NSE:BANKNIFTY{year_2digit}{month_code}FUT"
     else:
-        return None
+        # Check if it's an MCX contract (MCX commodities like CRUDEOIL, GOLD, SILVER, etc.)
+        # MCX underlying format: COMMODITY + MONTHCODE (e.g., CRUDEOILM, GOLDM, SILVERM)
+        # MCX future format: MCX:COMMODITY + MONTHCODE + YY + MONTH + FUT
+        # e.g., MCX:CRUDEOILM25NOVFUT
+        mcx_commodities = ['CRUDEOIL', 'GOLD', 'SILVER', 'COPPER', 'ZINC', 'LEAD', 'NICKEL', 'ALUMINIUM']
+        underlying_upper = underlying.upper()
+        
+        # Check if underlying starts with any MCX commodity name
+        is_mcx = False
+        for commodity in mcx_commodities:
+            if underlying_upper.startswith(commodity):
+                is_mcx = True
+                break
+        
+        if is_mcx:
+            # MCX future: MCX:COMMODITY + MONTHCODE + YY + MONTH + FUT
+            # e.g., MCX:CRUDEOILM25NOVFUT
+            future_symbol = f"MCX:{underlying}{year_2digit}{month_code}FUT"
+        else:
+            return None
     
     return future_symbol
 
@@ -290,19 +366,105 @@ def get_future_ltp(future_symbol):
         print(f"Error getting future LTP for {future_symbol}: {e}")
         return None
 
+def calculate_atm_strike(future_ltp, strike_distance=50):
+    """
+    Calculate At-The-Money (ATM) strike price
+    For NIFTY, strike distance is 50, so round to nearest 50
+    
+    Parameters:
+    - future_ltp: Last Traded Price of the future
+    - strike_distance: Strike interval (50 for NIFTY, 100 for BANKNIFTY)
+    
+    Returns:
+    - Rounded strike price
+    """
+    if future_ltp is None or future_ltp <= 0:
+        return None
+    
+    # Round to nearest strike_distance
+    atm_strike = round(future_ltp / strike_distance) * strike_distance
+    return int(atm_strike)
+
+def generate_option_symbol(underlying, expiry_date, strike, option_type, expiry_type='weekly', is_mcx=False):
+    """
+    Generate option symbol based on underlying, expiry, strike, and option type
+    
+    Parameters:
+    - underlying: Underlying symbol (e.g., "NIFTY", "CRUDEOIL")
+    - expiry_date: Expiry date (datetime object)
+    - strike: Strike price (integer)
+    - option_type: 'c' for Call (CE) or 'p' for Put (PE)
+    - expiry_type: 'weekly' or 'monthly'
+    - is_mcx: Boolean, True for MCX contracts (adds MCX: prefix)
+    
+    Returns:
+    - Option symbol string (e.g., "NSE:NIFTY25N1824500CE" for weekly or "MCX:CRUDEOIL25NOV25500CE" for MCX monthly)
+    """
+    try:
+        # Extract year (last 2 digits)
+        year_2digit = expiry_date.strftime('%y')  # e.g., "25" for 2025
+        
+        # Determine option type suffix
+        option_suffix = 'CE' if option_type.lower() == 'c' else 'PE'
+        
+        # Determine exchange prefix
+        exchange_prefix = 'MCX:' if is_mcx else 'NSE:'
+        
+        if expiry_type.lower() == 'weekly':
+            # Weekly format: NSE:NIFTY25N1824500CE or MCX:CRUDEOIL25N1824500CE
+            # Extract month code (single letter: J, F, M, A, M, J, J, A, S, O, N, D)
+            month_codes = ['J', 'F', 'M', 'A', 'M', 'J', 'J', 'A', 'S', 'O', 'N', 'D']
+            month = expiry_date.month - 1  # 0-indexed
+            month_code = month_codes[month]
+            
+            # Extract day (2 digits)
+            day = expiry_date.strftime('%d')  # e.g., "18"
+            
+            # Format: Exchange:Underlying + year + month_code + day + strike + option_suffix
+            option_symbol = f"{exchange_prefix}{underlying}{year_2digit}{month_code}{day}{strike}{option_suffix}"
+            
+        else:  # monthly
+            if is_mcx:
+                # MCX monthly format: MCX:CRUDEOILM25NOV5300CE
+                # Underlying already includes month code (e.g., CRUDEOILM)
+                # Extract month abbreviation (3 letters: JAN, FEB, MAR, etc.)
+                month_abbr = expiry_date.strftime('%b').upper()  # e.g., "NOV"
+                
+                # Format: MCX:UnderlyingWithMonthCode + year + month_abbr + strike + option_suffix
+                # e.g., MCX:CRUDEOILM25NOV5300CE
+                option_symbol = f"{exchange_prefix}{underlying}{year_2digit}{month_abbr}{strike}{option_suffix}"
+            else:
+                # NSE monthly format: NSE:NIFTY25NOV25500CE
+                # Extract month abbreviation (3 letters: JAN, FEB, MAR, etc.)
+                month_abbr = expiry_date.strftime('%b').upper()  # e.g., "NOV"
+                
+                # Format: Exchange:Underlying + year + month_abbr + strike + option_suffix
+                option_symbol = f"{exchange_prefix}{underlying}{year_2digit}{month_abbr}{strike}{option_suffix}"
+        
+        return option_symbol
+    except Exception as e:
+        print(f"Error generating option symbol: {e}")
+        return None
+
 def calculate_iv_pyvollib(option_price, underlying_price, strike, time_to_expiry, risk_free_rate=0.1, option_type='c'):
     """
-    Calculate Implied Volatility using py_vollib Black-Scholes model
+    Calculate Implied Volatility using py_vollib Black model (for options on futures)
+    
+    The Black model is appropriate for options on futures/forwards, which is the case
+    for Indian options that are settled on futures prices.
     
     Parameters:
     - option_price: Current option price
-    - underlying_price: Current underlying asset price (S)
+    - underlying_price: Current futures/forward price (F) - NOT spot price
     - strike: Strike price (K)
     - time_to_expiry: Time to expiration in years (t)
     - risk_free_rate: Risk-free interest rate (r), default 0.1 (10%)
     - option_type: 'c' for call, 'p' for put
     
     Returns: Implied volatility as decimal (e.g., 0.20 for 20%)
+    
+    Note: Black model parameter order: (price, F, K, r, t, flag)
+    This is different from Black-Scholes: (price, S, K, t, r, flag)
     """
     if not PY_VOLLIB_AVAILABLE:
         return None
@@ -317,15 +479,16 @@ def calculate_iv_pyvollib(option_price, underlying_price, strike, time_to_expiry
         return None
     
     try:
-        # py_vollib.black_scholes.implied_volatility expects:
-        # implied_volatility(price, S, K, t, r, flag)
+        # py_vollib.black.implied_volatility expects:
+        # implied_volatility(price, F, K, r, t, flag)
+        # Note: r and t are in different order than Black-Scholes!
         iv = implied_volatility(
             float(option_price),
-            float(underlying_price),
-            float(strike),
-            float(time_to_expiry),
-            float(risk_free_rate),
-            option_type
+            float(underlying_price),  # F = futures/forward price
+            float(strike),            # K = strike price
+            float(risk_free_rate),    # r = risk-free rate
+            float(time_to_expiry),    # t = time to expiry in years
+            option_type               # flag = 'c' or 'p'
         )
         return iv
     except Exception as e:
@@ -337,7 +500,7 @@ def calculate_iv_pyvollib(option_price, underlying_price, strike, time_to_expiry
             return None
         else:
             # Log unexpected errors only
-            print(f"Error calculating IV with py_vollib: {e}")
+            print(f"Error calculating IV with py_vollib Black model: {e}")
         return None
 
 def safe_fetch_ohlc(symbol, timeframe):
@@ -363,11 +526,11 @@ def safe_fetch_ohlc(symbol, timeframe):
 def calculate_iv(df, window=20, timeframe='1D', symbol=None, risk_free_rate=0.1, 
                 manual_strike=None, manual_expiry=None, manual_option_type=None):
     """
-    Calculate Implied Volatility using py_vollib (for options) or Historical Volatility (for underlying)
+    Calculate Implied Volatility using py_vollib Black model (for options) or Historical Volatility (for underlying)
     
     For Options:
-    - Uses py_vollib Black-Scholes model with option prices
-    - Requires: option_price, underlying_price, strike, time_to_expiry
+    - Uses py_vollib Black model with option prices (appropriate for options on futures)
+    - Requires: option_price, futures_price, strike, time_to_expiry
     
     Parameters:
     - manual_strike: Optional manual strike price (overrides parsed value)
@@ -432,8 +595,8 @@ def calculate_iv(df, window=20, timeframe='1D', symbol=None, risk_free_rate=0.1,
         option_info = parse_option_symbol(symbol) if symbol else None
     
     if option_info and PY_VOLLIB_AVAILABLE and option_info.get('strike') and option_info.get('expiry_date'):
-        # Calculate IV using py_vollib for options
-        print(f"Calculating IV using py_vollib for option: {symbol}")
+        # Calculate IV using py_vollib Black model for options (options on futures)
+        print(f"Calculating IV using py_vollib Black model for option: {symbol}")
         print(f"  Strike: {option_info['strike']}, Type: {option_info['option_type']}, Expiry: {option_info['expiry_date']}")
         
         underlying_symbol = option_info['underlying']
@@ -495,7 +658,7 @@ def calculate_iv(df, window=20, timeframe='1D', symbol=None, risk_free_rate=0.1,
                             time_to_expiry = (expiry_date - row_date).total_seconds() / (365.25 * 24 * 3600)
                             
                             if time_to_expiry > 0:
-                                # Calculate IV using py_vollib with historical future price
+                                # Calculate IV using py_vollib Black model with historical future price
                                 iv_decimal = calculate_iv_pyvollib(
                                     option_price=option_price,
                                     underlying_price=future_price,
@@ -543,13 +706,13 @@ def calculate_iv(df, window=20, timeframe='1D', symbol=None, risk_free_rate=0.1,
                     # Get valid IVs for logging
                     valid_ivs = [iv for iv in iv_values if iv is not None and not (isinstance(iv, float) and (np.isnan(iv) or np.isinf(iv)))]
                     if len(valid_ivs) > 0:
-                        print(f"Calculated IV using py_vollib with historical future prices (range: {min(valid_ivs):.2f}% - {max(valid_ivs):.2f}%)")
+                        print(f"Calculated IV using py_vollib Black model with historical future prices (range: {min(valid_ivs):.2f}% - {max(valid_ivs):.2f}%)")
                     
                     return df_merged
         else:
             print(f"Could not construct future symbol for {underlying_symbol}, falling back to historical volatility")
         
-        print("Failed to calculate IV with py_vollib, falling back to historical volatility")
+        print("Failed to calculate IV with py_vollib Black model, falling back to historical volatility")
     
     # Fallback to Historical Volatility calculation
     print("Using Historical Volatility calculation (rolling standard deviation)")
@@ -559,11 +722,13 @@ def calculate_iv(df, window=20, timeframe='1D', symbol=None, risk_free_rate=0.1,
     
     # Determine annualization factor based on timeframe
     timeframe_factors = {
+        '1s': 252 * 375 * 60,  # 1 second: 22500 seconds per day * 252 days
         '1': 252 * 375,  # 1 minute: 375 minutes per day * 252 days
         '5': 252 * 75,   # 5 minutes: 75 periods per day
         '15': 252 * 25,  # 15 minutes: 25 periods per day
         '30': 252 * 12,  # 30 minutes: 12 periods per day
         '60': 252 * 6,   # 1 hour: 6 periods per day
+        '120': 252 * 3,  # 2 hours: 3 periods per day
         '1D': 252,       # Daily: 252 trading days
     }
     
@@ -632,7 +797,175 @@ def calculate_iv(df, window=20, timeframe='1D', symbol=None, risk_free_rate=0.1,
     
     return df
 
-def fetch_data_loop(symbol, timeframe, manual_strike=None, manual_expiry=None, manual_option_type=None):
+def fetch_data_loop_automatic(future_symbol, expiry_date, expiry_type, option_type, timeframe, strike_distance, risk_free_rate=0.1):
+    """
+    Continuously fetch data in automatic mode:
+    1. Get future LTP
+    2. Calculate ATM strike
+    3. Generate option symbol
+    4. Fetch option data and calculate IV
+    5. Repeat every 1 minute
+    """
+    global iv_data_store, fetching_status
+    
+    # Extract underlying from future symbol
+    if ':' in future_symbol:
+        exchange_part = future_symbol.split(':')[0]  # "NSE" or "MCX"
+        underlying_part = future_symbol.split(':')[1]
+    else:
+        exchange_part = None
+        underlying_part = future_symbol
+    
+    # Detect MCX contracts
+    is_mcx = (exchange_part and exchange_part.upper() == 'MCX') or 'MCX:' in future_symbol.upper()
+    
+    underlying = None
+    if is_mcx:
+        # MCX contracts: Remove year (2 digits), month (3 letters), and FUT suffix
+        # e.g., CRUDEOILM25NOVFUT -> CRUDEOILM
+        # Pattern: COMMODITY + MONTHCODE + YY + MONTH + FUT
+        if underlying_part.endswith('FUT'):
+            # Remove FUT suffix first
+            base = underlying_part[:-3]
+            # Remove year (2 digits) + month (3 letters) from end
+            # Pattern: YY + MONTH (e.g., 25NOV)
+            import re
+            # Remove pattern: 2 digits + 3 letters from the end
+            underlying = re.sub(r'\d{2}[A-Z]{3}$', '', base)
+            # If regex didn't match, try simple approach
+            if underlying == base and len(base) >= 5:
+                # Check if last 5 characters match YY + MONTH pattern (2 digits + 3 letters)
+                if base[-5:-3].isdigit() and base[-3:].isalpha():
+                    underlying = base[:-5]
+                else:
+                    # Last resort: assume format is COMMODITY + MONTHCODE, keep as is
+                    underlying = base
+        else:
+            # No FUT suffix, might be just the commodity+monthcode
+            underlying = underlying_part
+    elif 'NIFTY' in underlying_part:
+        if 'BANK' in underlying_part:
+            underlying = 'BANKNIFTY'
+        else:
+            underlying = 'NIFTY'
+    
+    if not underlying:
+        print(f"Error: Could not extract underlying from {future_symbol}")
+        return
+    
+    iteration = 0
+    while fetching_status["active"] and fetching_status.get("mode") == "automatic":
+        try:
+            iteration += 1
+            print(f"\n=== Automatic Mode Iteration {iteration} ===")
+            
+            # Check if fyers is available
+            if FyresIntegration.fyers is None:
+                print("Fyers not initialized. Waiting...")
+                time.sleep(5)
+                continue
+            
+            # Get future LTP
+            future_ltp = get_future_ltp(future_symbol)
+            if future_ltp is None:
+                print(f"Could not fetch LTP for {future_symbol}. Retrying in 60 seconds...")
+                time.sleep(60)
+                continue
+            
+            print(f"Future LTP: {future_ltp}")
+            
+            # Calculate ATM strike
+            # Strike distance: 50 for NIFTY and MCX (Crude Oil), 100 for BANKNIFTY
+            if is_mcx:
+                strike_distance = 50  # MCX contracts (Crude Oil) use 50
+            elif 'BANK' in underlying:
+                strike_distance = 100  # BANKNIFTY uses 100
+            else:
+                strike_distance = 50  # NIFTY uses 50
+            
+            atm_strike = calculate_atm_strike(future_ltp, strike_distance)
+            if atm_strike is None:
+                print(f"Could not calculate ATM strike. Retrying in 60 seconds...")
+                time.sleep(60)
+                continue
+            
+            print(f"ATM Strike: {atm_strike}")
+            
+            # Generate option symbol (with MCX: prefix for MCX contracts)
+            symbol = generate_option_symbol(underlying, expiry_date, atm_strike, option_type, expiry_type, is_mcx=is_mcx)
+            if not symbol:
+                print(f"Could not generate option symbol. Retrying in 60 seconds...")
+                time.sleep(60)
+                continue
+            
+            print(f"Generated Option Symbol: {symbol}")
+            
+            # Update fetching status with current symbol
+            fetching_status["symbol"] = symbol
+            fetching_status["strike"] = atm_strike
+            
+            # Fetch historical data for the option symbol
+            df = safe_fetch_ohlc(symbol, timeframe)
+            
+            if df is None or len(df) == 0:
+                print(f"Failed to fetch data for {symbol}. Retrying in 60 seconds...")
+                time.sleep(60)
+                continue
+            
+            # Calculate IV
+            df_with_iv = calculate_iv(
+                df.copy(),
+                window=20,
+                timeframe=timeframe,
+                symbol=symbol,
+                risk_free_rate=risk_free_rate,
+                manual_strike=atm_strike,
+                manual_expiry=expiry_date.isoformat(),
+                manual_option_type=option_type
+            )
+            
+            if df_with_iv is not None and 'iv' in df_with_iv.columns:
+                # Filter out zero IV values for charting (but keep in CSV)
+                iv_values_for_chart = df_with_iv['iv'].fillna(0).tolist()
+                timestamps_for_chart = df_with_iv['date'].astype(str).tolist()
+                
+                # Store IV data with timestamps
+                iv_data_store[symbol] = {
+                    "timestamps": timestamps_for_chart,
+                    "iv_values": iv_values_for_chart,
+                    "close_prices": df_with_iv['close'].tolist(),
+                    "fclose_prices": df_with_iv['fclose'].tolist() if 'fclose' in df_with_iv.columns else [],
+                    "last_update": datetime.now().isoformat()
+                }
+                
+                # Log IV statistics
+                non_zero_ivs = [iv for iv in iv_values_for_chart if iv > 0]
+                if non_zero_ivs:
+                    print(f"IV data stored: {len(non_zero_ivs)} non-zero values (range: {min(non_zero_ivs):.2f}% - {max(non_zero_ivs):.2f}%)")
+                
+                # Save IV calculation to CSV file
+                save_iv_to_csv(
+                    symbol=symbol,
+                    df_with_iv=df_with_iv,
+                    timeframe=timeframe,
+                    strike=atm_strike,
+                    expiry=expiry_date.isoformat(),
+                    option_type=option_type
+                )
+            else:
+                print(f"Warning: Could not calculate IV for {symbol}")
+            
+            # Wait 60 seconds before next iteration
+            print(f"Waiting 60 seconds before next update...")
+            time.sleep(60)
+            
+        except Exception as e:
+            print(f"Error in automatic fetch loop: {e}")
+            import traceback
+            traceback.print_exc()
+            time.sleep(60)  # Wait before retrying
+
+def fetch_data_loop(symbol, timeframe, manual_strike=None, manual_expiry=None, manual_option_type=None, risk_free_rate=0.1):
     """Continuously fetch historical data and calculate IV"""
     global iv_data_store, fetching_status
     
@@ -658,13 +991,13 @@ def fetch_data_loop(symbol, timeframe, manual_strike=None, manual_expiry=None, m
             
             if df is not None and len(df) > 0:
                 try:
-                    # Calculate IV (will use py_vollib for options, historical volatility for underlying)
+                    # Calculate IV (will use py_vollib Black model for options, historical volatility for underlying)
                     df_with_iv = calculate_iv(
                         df.copy(), 
                         window=20, 
                         timeframe=timeframe, 
                         symbol=symbol, 
-                        risk_free_rate=0.1,
+                        risk_free_rate=risk_free_rate,
                         manual_strike=manual_strike,
                         manual_expiry=manual_expiry,
                         manual_option_type=manual_option_type
@@ -680,6 +1013,7 @@ def fetch_data_loop(symbol, timeframe, manual_strike=None, manual_expiry=None, m
                             "timestamps": timestamps_for_chart,
                             "iv_values": iv_values_for_chart,
                             "close_prices": df_with_iv['close'].tolist(),
+                            "fclose_prices": df_with_iv['fclose'].tolist() if 'fclose' in df_with_iv.columns else [],
                             "last_update": datetime.now().isoformat()
                         }
                         
@@ -803,41 +1137,191 @@ def check_login():
 @app.route('/api/start_fetching', methods=['POST'])
 def start_fetching():
     """Start fetching historical data and calculating IV"""
-    global fetching_status
+    global fetching_status, iv_data_store
     
     data = request.json
-    symbol = data.get('symbol')
+    mode = data.get('mode', 'manual')  # 'manual' or 'automatic'
     timeframe = data.get('timeframe')
-    strike = data.get('strike')  # Optional manual strike
-    expiry = data.get('expiry')  # Optional manual expiry (datetime string)
-    option_type = data.get('option_type')  # Optional manual option type ('c' or 'p')
+    risk_free_rate = data.get('risk_free_rate', 0.10)  # Default 10% (0.10)
     
-    if not symbol or not timeframe:
-        return jsonify({"success": False, "message": "Symbol and timeframe are required"}), 400
+    if not timeframe:
+        return jsonify({"success": False, "message": "Timeframe is required"}), 400
+    
+    # Validate risk_free_rate
+    try:
+        risk_free_rate = float(risk_free_rate)
+        if risk_free_rate < 0 or risk_free_rate > 1:
+            return jsonify({"success": False, "message": "Risk-free rate must be between 0 and 1 (0% to 100%)"}), 400
+    except (ValueError, TypeError):
+        return jsonify({"success": False, "message": "Invalid risk-free rate format"}), 400
     
     if not FyresIntegration.fyers:
         return jsonify({"success": False, "message": "Please login first"}), 401
     
     # Stop previous fetching if active
+    old_symbol = fetching_status.get("symbol")
     if fetching_status["active"]:
         fetching_status["active"] = False
         time.sleep(1)  # Wait for thread to stop
     
-    # Start new fetching with optional parameters
-    fetching_status = {
-        "active": True,
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "strike": strike,
-        "expiry": expiry,
-        "option_type": option_type
-    }
+    # Clear old data: delete all CSV files and clear iv_data_store
+    print("Clearing old data before starting new fetch...")
+    deleted_count = delete_csv_files()  # Delete all CSV files
+    if old_symbol and old_symbol in iv_data_store:
+        del iv_data_store[old_symbol]
+        print(f"Cleared IV data store for old symbol: {old_symbol}")
+    # Also clear any other symbols in the store
+    iv_data_store.clear()
+    print("Cleared all IV data from memory")
     
-    # Start fetching in background thread
-    thread = threading.Thread(target=fetch_data_loop, args=(symbol, timeframe, strike, expiry, option_type), daemon=True)
-    thread.start()
+    if mode == 'automatic':
+        # Automatic mode: Generate option symbol from future symbol
+        future_symbol = data.get('future_symbol')
+        expiry_type = data.get('expiry_type', 'weekly')  # 'weekly' or 'monthly'
+        expiry_date_str = data.get('expiry_date')
+        option_type = data.get('option_type', 'c')  # 'c' for Call, 'p' for Put
+        
+        if not future_symbol or not expiry_date_str:
+            return jsonify({"success": False, "message": "Future symbol and expiry date are required for automatic mode"}), 400
+        
+        try:
+            # Parse expiry date
+            expiry_date = datetime.strptime(expiry_date_str, '%Y-%m-%d')
+        except:
+            try:
+                expiry_date = datetime.fromisoformat(expiry_date_str.replace('Z', '+00:00'))
+                if expiry_date.tzinfo:
+                    expiry_date = expiry_date.replace(tzinfo=None)
+            except:
+                return jsonify({"success": False, "message": "Invalid expiry date format"}), 400
+        
+        # Extract underlying from future symbol (e.g., "NSE:NIFTY25NOVFUT" -> "NIFTY", "MCX:CRUDEOILM" -> "CRUDEOIL")
+        if ':' in future_symbol:
+            exchange_part = future_symbol.split(':')[0]  # "NSE" or "MCX"
+            underlying_part = future_symbol.split(':')[1]
+        else:
+            exchange_part = None
+            underlying_part = future_symbol
+        
+        # Detect MCX contracts
+        is_mcx = (exchange_part and exchange_part.upper() == 'MCX') or 'MCX:' in future_symbol.upper()
+        
+        # Remove FUT suffix and year/month codes to get underlying
+        # For NIFTY25NOVFUT, we need to extract "NIFTY"
+        # For MCX:CRUDEOILM25NOVFUT, we need to extract "CRUDEOILM" (remove 25NOVFUT)
+        underlying = None
+        if is_mcx:
+            # MCX contracts: Remove year (2 digits), month (3 letters), and FUT suffix
+            # e.g., CRUDEOILM25NOVFUT -> CRUDEOILM
+            # Pattern: COMMODITY + MONTHCODE + YY + MONTH + FUT
+            if underlying_part.endswith('FUT'):
+                # Remove FUT suffix first
+                base = underlying_part[:-3]
+                # Remove year (2 digits) + month (3 letters) from end
+                # Pattern: YY + MONTH (e.g., 25NOV)
+                import re
+                # Remove pattern: 2 digits + 3 letters from the end
+                underlying = re.sub(r'\d{2}[A-Z]{3}$', '', base)
+                # If regex didn't match, try simple approach
+                if underlying == base and len(base) >= 5:
+                    # Check if last 5 characters match YY + MONTH pattern (2 digits + 3 letters)
+                    if base[-5:-3].isdigit() and base[-3:].isalpha():
+                        underlying = base[:-5]
+                    else:
+                        # Last resort: assume format is COMMODITY + MONTHCODE, keep as is
+                        underlying = base
+            else:
+                # No FUT suffix, might be just the commodity+monthcode
+                underlying = underlying_part
+        elif 'NIFTY' in underlying_part:
+            if 'BANK' in underlying_part:
+                underlying = 'BANKNIFTY'
+            else:
+                underlying = 'NIFTY'
+        
+        if not underlying:
+            return jsonify({"success": False, "message": "Could not extract underlying from future symbol"}), 400
+        
+        # Get future LTP
+        future_ltp = get_future_ltp(future_symbol)
+        if future_ltp is None:
+            return jsonify({"success": False, "message": f"Could not fetch LTP for {future_symbol}"}), 400
+        
+        # Calculate ATM strike
+        # Strike distance: 50 for NIFTY and MCX (Crude Oil), 100 for BANKNIFTY
+        if is_mcx:
+            strike_distance = 50  # MCX contracts (Crude Oil) use 50
+        elif 'BANK' in underlying:
+            strike_distance = 100  # BANKNIFTY uses 100
+        else:
+            strike_distance = 50  # NIFTY uses 50
+        
+        atm_strike = calculate_atm_strike(future_ltp, strike_distance)
+        
+        if atm_strike is None:
+            return jsonify({"success": False, "message": "Could not calculate ATM strike"}), 400
+        
+        # Generate option symbol (with MCX: prefix for MCX contracts)
+        symbol = generate_option_symbol(underlying, expiry_date, atm_strike, option_type, expiry_type, is_mcx=is_mcx)
+        
+        if not symbol:
+            return jsonify({"success": False, "message": "Could not generate option symbol"}), 400
+        
+        print(f"Automatic mode: Generated option symbol {symbol} from future {future_symbol} (LTP: {future_ltp}, ATM Strike: {atm_strike})")
+        
+        # Start new fetching with generated symbol
+        fetching_status = {
+            "active": True,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "mode": "automatic",
+            "future_symbol": future_symbol,
+            "expiry_type": expiry_type,
+            "expiry_date": expiry_date_str,
+            "option_type": option_type,
+            "strike": atm_strike,
+            "expiry": expiry_date.isoformat()
+        }
+        
+        # Start fetching in background thread with automatic mode
+        # Note: strike_distance is calculated above and passed to the thread
+        thread = threading.Thread(target=fetch_data_loop_automatic, args=(future_symbol, expiry_date, expiry_type, option_type, timeframe, strike_distance, risk_free_rate), daemon=True)
+        thread.start()
+        
+        return jsonify({
+            "success": True, 
+            "message": "Automatic data fetching started",
+            "generated_symbol": symbol,
+            "future_ltp": future_ltp,
+            "atm_strike": atm_strike
+        })
     
-    return jsonify({"success": True, "message": "Data fetching started"})
+    else:
+        # Manual mode: Use provided symbol
+        symbol = data.get('symbol')
+        strike = data.get('strike')  # Optional manual strike
+        expiry = data.get('expiry')  # Optional manual expiry (datetime string)
+        option_type = data.get('option_type')  # Optional manual option type ('c' or 'p')
+        
+        if not symbol:
+            return jsonify({"success": False, "message": "Symbol is required for manual mode"}), 400
+        
+        # Start new fetching with optional parameters
+        fetching_status = {
+            "active": True,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "mode": "manual",
+            "strike": strike,
+            "expiry": expiry,
+            "option_type": option_type
+        }
+        
+        # Start fetching in background thread
+        thread = threading.Thread(target=fetch_data_loop, args=(symbol, timeframe, strike, expiry, option_type, risk_free_rate), daemon=True)
+        thread.start()
+        
+        return jsonify({"success": True, "message": "Data fetching started"})
 
 @app.route('/api/stop_fetching', methods=['POST'])
 def stop_fetching():
@@ -858,12 +1342,85 @@ def get_iv_data():
         return jsonify(data)
     else:
         print(f"No IV data found for symbol: {symbol}")
-        return jsonify({"timestamps": [], "iv_values": [], "close_prices": [], "last_update": None})
+        return jsonify({"timestamps": [], "iv_values": [], "close_prices": [], "fclose_prices": [], "last_update": None})
 
 @app.route('/api/get_status', methods=['GET'])
 def get_status():
     """Get current fetching status"""
     return jsonify(fetching_status)
+
+@app.route('/api/load_csv_data', methods=['GET'])
+def load_csv_data():
+    """Load IV data from CSV files in data folder"""
+    try:
+        # Get list of CSV files in data folder
+        csv_files = [f for f in os.listdir(DATA_FOLDER) if f.endswith('.csv')]
+        
+        if not csv_files:
+            return jsonify({"success": False, "message": "No CSV files found in data folder"}), 404
+        
+        # Get the most recent CSV file or a specific one
+        symbol = request.args.get('symbol')
+        if symbol:
+            # Sanitize symbol for filename
+            safe_symbol = re.sub(r'[<>:"/\\|?*]', '_', symbol)
+            safe_symbol = safe_symbol.replace(':', '_').replace(' ', '_')
+            filename = os.path.join(DATA_FOLDER, f"{safe_symbol}.csv")
+        else:
+            # Use the most recent CSV file
+            csv_files_with_paths = [(os.path.join(DATA_FOLDER, f), os.path.getmtime(os.path.join(DATA_FOLDER, f))) for f in csv_files]
+            csv_files_with_paths.sort(key=lambda x: x[1], reverse=True)
+            filename = csv_files_with_paths[0][0]
+        
+        if not os.path.exists(filename):
+            return jsonify({"success": False, "message": f"CSV file not found: {filename}"}), 404
+        
+        # Read CSV file
+        df = pd.read_csv(filename)
+        
+        # Ensure required columns exist
+        if 'date' not in df.columns or 'iv' not in df.columns:
+            return jsonify({"success": False, "message": "CSV file missing required columns (date, iv)"}), 400
+        
+        # Convert date column to datetime
+        df['date'] = pd.to_datetime(df['date'])
+        
+        # Sort by date
+        df = df.sort_values('date')
+        
+        # Convert to format expected by frontend
+        timestamps = df['date'].dt.strftime('%Y-%m-%d %H:%M:%S').tolist()
+        iv_values = df['iv'].fillna(0).tolist()
+        close_prices = df['close'].tolist() if 'close' in df.columns else []
+        fclose_prices = df['fclose'].tolist() if 'fclose' in df.columns else []
+        
+        # Get symbol name from filename
+        symbol_name = os.path.basename(filename).replace('.csv', '')
+        
+        return jsonify({
+            "success": True,
+            "timestamps": timestamps,
+            "iv_values": iv_values,
+            "close_prices": close_prices,
+            "fclose_prices": fclose_prices,
+            "symbol": symbol_name,
+            "data_points": len(timestamps),
+            "last_update": timestamps[-1] if timestamps else None
+        })
+    except Exception as e:
+        print(f"Error loading CSV data: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"success": False, "message": str(e)}), 500
+
+@app.route('/api/list_csv_files', methods=['GET'])
+def list_csv_files():
+    """List all available CSV files in data folder"""
+    try:
+        csv_files = [f.replace('.csv', '') for f in os.listdir(DATA_FOLDER) if f.endswith('.csv')]
+        return jsonify({"success": True, "files": csv_files})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
