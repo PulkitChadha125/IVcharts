@@ -77,15 +77,31 @@ def automated_login(client_id,secret_key,FY_ID,TOTP_KEY,PIN,redirect_uri):
 
     if datetime.now().second % 30 > 27: sleep(5)
     URL_VERIFY_OTP = "https://api-t2.fyers.in/vagator/v2/verify_otp"
-    res2 = requests.post(url=URL_VERIFY_OTP,
-                         json={"request_key": res["request_key"], "otp": pyotp.TOTP(TOTP_KEY).now()}).json()
-    print(res2)
+    otp_response = requests.post(url=URL_VERIFY_OTP,
+                         json={"request_key": res["request_key"], "otp": pyotp.TOTP(TOTP_KEY).now()})
+    
+    if otp_response.status_code != 200:
+        raise Exception(f"Failed to verify OTP. Status: {otp_response.status_code}, Response: {otp_response.text}")
+    
+    res2 = otp_response.json()
+    print("OTP verification response:", res2)
+    
+    if 'request_key' not in res2:
+        raise Exception(f"Missing 'request_key' in OTP verification response: {res2}")
 
     ses = requests.Session()
     URL_VERIFY_OTP2 = "https://api-t2.fyers.in/vagator/v2/verify_pin_v2"
     payload2 = {"request_key": res2["request_key"], "identity_type": "pin", "identifier": getEncodedString(PIN)}
-    res3 = ses.post(url=URL_VERIFY_OTP2, json=payload2).json()
-    print("res3: ",res3)
+    pin_response = ses.post(url=URL_VERIFY_OTP2, json=payload2)
+    
+    if pin_response.status_code != 200:
+        raise Exception(f"Failed to verify PIN. Status: {pin_response.status_code}, Response: {pin_response.text}")
+    
+    res3 = pin_response.json()
+    print("PIN verification response:", res3)
+    
+    if 'data' not in res3 or 'access_token' not in res3['data']:
+        raise Exception(f"Missing 'access_token' in PIN verification response: {res3}")
 
     ses.headers.update({
         'authorization': f"Bearer {res3['data']['access_token']}"
@@ -98,11 +114,32 @@ def automated_login(client_id,secret_key,FY_ID,TOTP_KEY,PIN,redirect_uri):
                 "appType": "100", "code_challenge": "",
                 "state": "None", "scope": "", "nonce": "", "response_type": "code", "create_cookie": True}
 
-    res3 = ses.post(url=TOKENURL, json=payload3).json()
-    print("res3: ",res3)
+    token_response = ses.post(url=TOKENURL, json=payload3, allow_redirects=False)
+    
+    # Handle both 200 (OK) and 308 (Permanent Redirect) status codes
+    # 308 is a redirect, but the response body still contains the JSON with the URL
+    if token_response.status_code not in [200, 308]:
+        raise Exception(f"Failed to get token URL. Status: {token_response.status_code}, Response: {token_response.text}")
+    
+    # Parse JSON response (works for both 200 and 308)
+    try:
+        res3 = token_response.json()
+    except json.JSONDecodeError:
+        raise Exception(f"Invalid JSON response from token URL request: {token_response.text}")
+    
+    print("Token URL response:", res3)
+    
+    if 'Url' not in res3:
+        raise Exception(f"Missing 'Url' in token response: {res3}")
+    
     url = res3['Url']
     parsed = urlparse(url)
-    auth_code = parse_qs(parsed.query)['auth_code'][0]
+    query_params = parse_qs(parsed.query)
+    
+    if 'auth_code' not in query_params or len(query_params['auth_code']) == 0:
+        raise Exception(f"Missing 'auth_code' in URL: {url}")
+    
+    auth_code = query_params['auth_code'][0]
     grant_type = "authorization_code"
 
     response_type = "code"
@@ -143,7 +180,20 @@ def automated_login(client_id,secret_key,FY_ID,TOTP_KEY,PIN,redirect_uri):
     
     print("access_token: ",access_token)
     fyers = fyersModel.FyersModel(client_id=client_id, is_async=False, token=access_token, log_path=os.getcwd())
-    print(fyers.get_profile())
+    
+    # Verify fyers object was created successfully
+    if fyers is None:
+        raise Exception("Failed to create FyersModel object")
+    
+    # Test the connection by getting profile
+    try:
+        profile = fyers.get_profile()
+        print("Profile retrieved successfully:", profile)
+    except Exception as e:
+        print(f"Warning: Could not get profile after login: {e}")
+        # Don't raise - fyers object might still be valid
+    
+    print("automated_login completed successfully")
 
 def get_ltp(SYMBOL):
     global fyers

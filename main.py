@@ -11,6 +11,14 @@ import FyresIntegration
 import threading
 import time
 
+# Import pytz for timezone handling (for market hours)
+try:
+    import pytz
+    PYTZ_AVAILABLE = True
+except ImportError:
+    PYTZ_AVAILABLE = False
+    print("Warning: pytz not installed. Install with: pip install pytz")
+
 # Import py_vollib for Black model IV calculation (for options on futures)
 try:
     from py_vollib.black.implied_volatility import implied_volatility
@@ -26,11 +34,135 @@ app.secret_key = 'your-secret-key-here'  # Change this in production
 iv_data_store = {}
 fetching_status = {"active": False, "symbol": None, "timeframe": None}
 
+# Global logs storage (max 1000 entries to prevent memory issues)
+app_logs = []
+MAX_LOGS = 1000
+
+def add_log(level, message, details=None):
+    """
+    Add a log entry to the application logs
+    
+    Parameters:
+    - level: 'ERROR', 'WARNING', 'INFO', 'DEBUG'
+    - message: Main log message
+    - details: Optional additional details (dict or string)
+    """
+    global app_logs
+    log_entry = {
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'level': level,
+        'message': str(message),
+        'details': str(details) if details else None
+    }
+    app_logs.append(log_entry)
+    
+    # Keep only the last MAX_LOGS entries
+    if len(app_logs) > MAX_LOGS:
+        app_logs = app_logs[-MAX_LOGS:]
+    
+    # Also print to console for debugging
+    print(f"[{log_entry['timestamp']}] [{level}] {message}")
+    if details:
+        print(f"  Details: {details}")
+
 # Create data folder if it doesn't exist
 DATA_FOLDER = 'data'
 if not os.path.exists(DATA_FOLDER):
     os.makedirs(DATA_FOLDER)
     print(f"Created data folder: {DATA_FOLDER}")
+
+# Market hours configuration
+# NSE: 9:15 AM to 3:30 PM IST
+# MCX: 9:00 AM to 11:30 PM IST (23:30)
+MARKET_HOURS = {
+    'NSE': {'open': (9, 15), 'close': (15, 30)},  # 9:15 AM to 3:30 PM IST
+    'MCX': {'open': (9, 0), 'close': (23, 30)}     # 9:00 AM to 11:30 PM IST
+}
+
+def is_market_open(symbol=None, exchange=None):
+    """
+    Check if market is currently open based on symbol or exchange
+    Returns True if market is open, False otherwise
+    
+    Market hours:
+    - NSE: 9:15 AM to 3:30 PM IST
+    - MCX: 9:00 AM to 11:30 PM IST (23:30)
+    """
+    # Determine exchange from symbol or use provided exchange
+    if not exchange:
+        if symbol:
+            if symbol.startswith('MCX:'):
+                exchange = 'MCX'
+            elif symbol.startswith('NSE:'):
+                exchange = 'NSE'
+            else:
+                # Default to NSE if not specified
+                exchange = 'NSE'
+        else:
+            exchange = 'NSE'  # Default
+    
+    if exchange not in MARKET_HOURS:
+        return True  # If exchange not recognized, assume market is open
+    
+    # Get current IST time
+    if PYTZ_AVAILABLE:
+        ist = pytz.timezone('Asia/Kolkata')
+        current_time = datetime.now(ist)
+    else:
+        # Fallback: assume IST is UTC+5:30 (not perfect but works)
+        current_time = datetime.now()
+    
+    current_hour = current_time.hour
+    current_minute = current_time.minute
+    current_weekday = current_time.weekday()  # 0 = Monday, 6 = Sunday
+    
+    # Check if it's a weekend (Saturday = 5, Sunday = 6)
+    if current_weekday >= 5:
+        return False
+    
+    # Get market hours
+    market_open = MARKET_HOURS[exchange]['open']
+    market_close = MARKET_HOURS[exchange]['close']
+    
+    open_hour, open_minute = market_open
+    close_hour, close_minute = market_close
+    
+    # Convert to minutes for easier comparison
+    current_minutes = current_hour * 60 + current_minute
+    open_minutes = open_hour * 60 + open_minute
+    close_minutes = close_hour * 60 + close_minute
+    
+    # Check if current time is within market hours
+    return open_minutes <= current_minutes <= close_minutes
+
+# Clean up CSV files on app start (OPTIONAL - can be bypassed)
+# Set CLEANUP_ON_START = False to keep CSV files across sessions
+CLEANUP_ON_START = False  # Set to True if you want fresh start on every app launch
+
+def cleanup_csv_files():
+    """Delete all CSV files from data folder for fresh start (optional)"""
+    if not CLEANUP_ON_START:
+        print("CSV cleanup on startup is disabled - keeping existing CSV files")
+        return
+    
+    try:
+        if os.path.exists(DATA_FOLDER):
+            csv_files = [f for f in os.listdir(DATA_FOLDER) if f.endswith('.csv')]
+            deleted_count = 0
+            for csv_file in csv_files:
+                filepath = os.path.join(DATA_FOLDER, csv_file)
+                try:
+                    os.remove(filepath)
+                    deleted_count += 1
+                except Exception as e:
+                    print(f"Warning: Could not delete {csv_file}: {e}")
+            if deleted_count > 0:
+                print(f"Cleaned up {deleted_count} CSV file(s) from data folder for fresh start")
+    except Exception as e:
+        print(f"Warning: Could not clean up CSV files: {e}")
+
+# Clean up on app start (only if CLEANUP_ON_START is True)
+cleanup_csv_files()
 
 def delete_csv_files(symbol=None):
     """
@@ -65,9 +197,13 @@ def delete_csv_files(symbol=None):
                     print(f"Error deleting {filepath}: {e}")
         
         print(f"Deleted {deleted_count} CSV file(s)")
+        if deleted_count > 0:
+            add_log('INFO', f'Deleted {deleted_count} CSV file(s)', {'deleted_count': deleted_count, 'symbol': symbol if symbol else 'all'})
         return deleted_count
     except Exception as e:
-        print(f"Error deleting CSV files: {e}")
+        error_msg = f"Error deleting CSV files: {e}"
+        print(error_msg)
+        add_log('ERROR', error_msg, {'error': str(e), 'symbol': symbol if symbol else 'all'})
         import traceback
         traceback.print_exc()
         return 0
@@ -83,6 +219,82 @@ def load_credentials():
         return credentials
     except Exception as e:
         print(f"Error loading credentials: {e}")
+        return None
+
+def load_symbol_settings():
+    """
+    Load symbol settings from SymbolSetting.csv
+    Returns list of dicts with: prefix, symbol, expiry_date, strike_step
+    """
+    symbols = []
+    try:
+        with open('SymbolSetting.csv', 'r') as file:
+            reader = csv.DictReader(file)
+            for row in reader:
+                try:
+                    prefix = row.get('Prefix', '').strip()
+                    symbol = row.get('SYMBOL', '').strip()
+                    expiry_str = row.get('EXPIERY', '').strip()
+                    strike_step_str = row.get('StrikeStep', '').strip()
+                    
+                    if not prefix or not symbol or not expiry_str:
+                        continue
+                    
+                    # Parse expiry date (format: DD-MM-YYYY)
+                    try:
+                        expiry_date = datetime.strptime(expiry_str, '%d-%m-%Y')
+                    except ValueError:
+                        # Try alternative format
+                        try:
+                            expiry_date = datetime.strptime(expiry_str, '%Y-%m-%d')
+                        except ValueError:
+                            print(f"Could not parse expiry date: {expiry_str}")
+                            continue
+                    
+                    # Parse strike step
+                    strike_step = None
+                    if strike_step_str:
+                        try:
+                            strike_step = float(strike_step_str)
+                        except ValueError:
+                            pass
+                    
+                    symbols.append({
+                        'prefix': prefix,
+                        'symbol': symbol,
+                        'expiry_date': expiry_date,
+                        'strike_step': strike_step,
+                        'expiry_str': expiry_str
+                    })
+                except Exception as e:
+                    print(f"Error parsing symbol row: {row}, Error: {e}")
+                    continue
+        
+        return symbols
+    except FileNotFoundError:
+        print("SymbolSetting.csv not found. Creating default file...")
+        # Create default file
+        default_symbols = [
+            {'prefix': 'NSE', 'symbol': 'NIFTY', 'expiry_date': datetime(2025, 11, 25), 'strike_step': 50, 'expiry_str': '25-11-2025'}
+        ]
+        return default_symbols
+    except Exception as e:
+        print(f"Error loading symbol settings: {e}")
+        return []
+
+def generate_future_symbol_from_settings(prefix, symbol, expiry_date):
+    """
+    Generate future symbol from settings format
+    Format: {PREFIX}:{SYMBOL}{YEARFROMDATE}{MONTHFROMDATE}{FUT}
+    Example: NSE:NIFTY25NOVFUT
+    """
+    try:
+        year_2digit = expiry_date.strftime('%y')  # e.g., "25"
+        month_abbr = expiry_date.strftime('%b').upper()  # e.g., "NOV"
+        future_symbol = f"{prefix}:{symbol}{year_2digit}{month_abbr}FUT"
+        return future_symbol
+    except Exception as e:
+        print(f"Error generating future symbol: {e}")
         return None
 
 def save_iv_to_csv(symbol, df_with_iv, timeframe=None, strike=None, expiry=None, option_type=None):
@@ -213,51 +425,105 @@ def parse_option_symbol(symbol):
     else:
         return None
     
-    # Extract year and month
-    # Pattern: YY + M or YY + MONTHNAME
-    year_match = re.search(r'(\d{2})([A-Z]{1,3})$', base)
-    if year_match:
-        year_str = year_match.group(1)
-        month_code = year_match.group(2)
+    # Extract year, month, and day
+    # Pattern for weekly: YY + M + DD (e.g., 25N18 = 2025 Nov 18) - NIFTY25N1825500CE
+    # Pattern for monthly: YY + MONTHNAME (e.g., 25NOV = 2025 Nov) - NIFTY25NOV25500CE
+    
+    # Try weekly format first: YY + single_letter_month + 2_digit_day
+    weekly_match = re.search(r'(\d{2})([A-Z])(\d{2})(\d+)$', base)
+    if weekly_match:
+        # Weekly option: Extract day from symbol
+        year_str = weekly_match.group(1)
+        month_code = weekly_match.group(2)
+        day_str = weekly_match.group(3)
+        # strike_str would be in group(4), but we already extracted it above
         
         # Convert 2-digit year to 4-digit
         year = 2000 + int(year_str)
-        
-        # Month codes: J=F, F=G, M=H, A=I, M=J, J=K, J=L, A=M, S=N, O=O, N=P, D=Q
-        # Common: JAN, FEB, MAR, APR, MAY, JUN, JUL, AUG, SEP, OCT, NOV, DEC
-        month_map = {
-            'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6,
-            'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12,
-            'J': 1, 'F': 2, 'M': 3, 'A': 4, 'M': 5, 'J': 6,
-            'J': 7, 'A': 8, 'S': 9, 'O': 10, 'N': 11, 'D': 12
-        }
+        day = int(day_str)
         
         # Single letter month codes (NSE style)
         single_letter_map = {
             'J': 1, 'F': 2, 'M': 3, 'A': 4, 'M': 5, 'J': 6,
             'J': 7, 'A': 8, 'S': 9, 'O': 10, 'N': 11, 'D': 12
         }
+        month = single_letter_map.get(month_code, 12)
         
-        if len(month_code) == 1:
-            # Single letter: J, F, M, A, M, J, J, A, S, O, N, D
-            month = single_letter_map.get(month_code, 12)
-        elif month_code in month_map:
-            month = month_map[month_code]
+        # Get underlying symbol (everything before year+month+day+strike)
+        # We need to remove: year_str + month_code + day_str + strike_str
+        underlying = base[:-len(year_str + month_code + day_str + strike_str)]
+        
+        # Weekly options expire on the specified day
+        # NSE (NIFTY) options expire at 3:15 PM IST
+        # MCX options expire at 11:20 PM IST
+        # Determine expiry time based on exchange (NSE vs MCX)
+        if is_mcx:
+            expiry_date = datetime(year, month, day, 23, 20, 0)  # 11:20 PM IST for MCX
         else:
-            # Default to December if can't parse
-            month = 12
-        
-        # Get underlying symbol (everything before year)
-        underlying = base[:-len(year_str + month_code)]
-        
-        # For MCX, keep the underlying as-is (e.g., CRUDEOILM)
-        # For NSE, underlying is already correct (e.g., NIFTY)
-        
-        # For expiry, use last Thursday of the month (standard for NSE)
-        # Simplified: use last day of month
-        from calendar import monthrange
-        last_day = monthrange(year, month)[1]
-        expiry_date = datetime(year, month, last_day, 15, 30, 0)  # 3:30 PM IST
+            expiry_date = datetime(year, month, day, 15, 15, 0)  # 3:15 PM IST for NSE
+    else:
+        # Try monthly format: YY + MONTHNAME (3 letters)
+        year_match = re.search(r'(\d{2})([A-Z]{1,3})$', base)
+        if year_match:
+            year_str = year_match.group(1)
+            month_code = year_match.group(2)
+            
+            # Convert 2-digit year to 4-digit
+            year = 2000 + int(year_str)
+            
+            # Month codes
+            month_map = {
+                'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6,
+                'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12,
+                'J': 1, 'F': 2, 'M': 3, 'A': 4, 'M': 5, 'J': 6,
+                'J': 7, 'A': 8, 'S': 9, 'O': 10, 'N': 11, 'D': 12
+            }
+            
+            # Single letter month codes (NSE style)
+            single_letter_map = {
+                'J': 1, 'F': 2, 'M': 3, 'A': 4, 'M': 5, 'J': 6,
+                'J': 7, 'A': 8, 'S': 9, 'O': 10, 'N': 11, 'D': 12
+            }
+            
+            if len(month_code) == 1:
+                # Single letter: J, F, M, A, M, J, J, A, S, O, N, D
+                month = single_letter_map.get(month_code, 12)
+            elif month_code in month_map:
+                month = month_map[month_code]
+            else:
+                # Default to December if can't parse
+                month = 12
+            
+            # Get underlying symbol (everything before year+month)
+            underlying = base[:-len(year_str + month_code)]
+            
+            # For monthly options, use last Thursday of the month (standard for NSE)
+            # NIFTY monthly options expire on the last Thursday of the month at 3:30 PM IST
+            from calendar import monthrange, weekday
+            last_day = monthrange(year, month)[1]
+            # Find the last Thursday of the month
+            last_thursday = None
+            for day in range(last_day, 0, -1):
+                if weekday(year, month, day) == 3:  # Thursday = 3
+                    last_thursday = day
+                    break
+            
+            if last_thursday:
+                # Use last Thursday
+                # NSE (NIFTY) monthly options expire at 3:15 PM IST
+                # MCX monthly options expire at 11:20 PM IST
+                if is_mcx:
+                    expiry_date = datetime(year, month, last_thursday, 23, 20, 0)  # 11:20 PM IST for MCX
+                else:
+                    expiry_date = datetime(year, month, last_thursday, 15, 15, 0)  # 3:15 PM IST for NSE
+            else:
+                # Fallback: use last day if no Thursday found (shouldn't happen)
+                if is_mcx:
+                    expiry_date = datetime(year, month, last_day, 23, 20, 0)  # 11:20 PM IST for MCX
+                else:
+                    expiry_date = datetime(year, month, last_day, 15, 15, 0)  # 3:15 PM IST for NSE
+        else:
+            return None
         
         return {
             'underlying': underlying,  # e.g., "CRUDEOILM" for MCX or "NIFTY" for NSE
@@ -282,8 +548,10 @@ def get_option_price_from_fyers(option_symbol):
             ltp = response['d'][0]['v'].get('lp', None)
             return ltp
     except Exception as e:
-        print(f"Error getting option price for {option_symbol}: {e}")
-    return None
+        error_msg = f"Error getting option price for {option_symbol}"
+        print(f"{error_msg}: {e}")
+        add_log('ERROR', error_msg, {'symbol': option_symbol, 'error': str(e)})
+        return None
 
 def get_underlying_price_from_fyers(underlying_symbol):
     """Get current underlying asset price from Fyers API"""
@@ -297,8 +565,10 @@ def get_underlying_price_from_fyers(underlying_symbol):
             ltp = response['d'][0]['v'].get('lp', None)
             return ltp
     except Exception as e:
-        print(f"Error getting underlying price for {underlying_symbol}: {e}")
-    return None
+        error_msg = f"Error getting underlying price for {underlying_symbol}"
+        print(f"{error_msg}: {e}")
+        add_log('ERROR', error_msg, {'symbol': underlying_symbol, 'error': str(e)})
+        return None
 
 def get_future_symbol(underlying, expiry_date):
     """
@@ -363,7 +633,9 @@ def get_future_ltp(future_symbol):
         ltp = get_ltp(future_symbol)
         return ltp
     except Exception as e:
-        print(f"Error getting future LTP for {future_symbol}: {e}")
+        error_msg = f"Error getting future LTP for {future_symbol}"
+        print(f"{error_msg}: {e}")
+        add_log('WARNING', error_msg, {'symbol': future_symbol, 'error': str(e)})
         return None
 
 def calculate_atm_strike(future_ltp, strike_distance=50):
@@ -425,14 +697,33 @@ def generate_option_symbol(underlying, expiry_date, strike, option_type, expiry_
             
         else:  # monthly
             if is_mcx:
-                # MCX monthly format: MCX:CRUDEOILM25NOV5300CE
-                # Underlying already includes month code (e.g., CRUDEOILM)
-                # Extract month abbreviation (3 letters: JAN, FEB, MAR, etc.)
-                month_abbr = expiry_date.strftime('%b').upper()  # e.g., "NOV"
+                # MCX monthly format: MCX:CRUDEOIL25DEC5300CE
+                # Remove month code from underlying (e.g., CRUDEOILM -> CRUDEOIL)
+                # MCX futures have month code (CRUDEOILM), but options don't use it
+                underlying_clean = underlying
                 
-                # Format: MCX:UnderlyingWithMonthCode + year + month_abbr + strike + option_suffix
-                # e.g., MCX:CRUDEOILM25NOV5300CE
-                option_symbol = f"{exchange_prefix}{underlying}{year_2digit}{month_abbr}{strike}{option_suffix}"
+                # List of MCX commodities (base names without month codes)
+                mcx_commodities = ['CRUDEOIL', 'GOLD', 'SILVER', 'COPPER', 'ZINC', 'LEAD', 'NICKEL', 'ALUMINIUM', 'NATURALGAS']
+                
+                # Remove month code from underlying if it exists
+                # Check if underlying starts with any commodity name
+                for commodity in mcx_commodities:
+                    if underlying_clean.upper().startswith(commodity):
+                        # If underlying is longer than commodity, it likely has a month code suffix
+                        if len(underlying_clean) > len(commodity):
+                            # Use just the commodity name (remove month code)
+                            underlying_clean = commodity
+                        else:
+                            # Already clean, use as is
+                            underlying_clean = commodity
+                        break
+                
+                # Extract month abbreviation (3 letters: JAN, FEB, MAR, etc.)
+                month_abbr = expiry_date.strftime('%b').upper()  # e.g., "DEC"
+                
+                # Format: MCX:COMMODITY + year + month_abbr + strike + option_suffix
+                # e.g., MCX:CRUDEOIL25DEC5300CE
+                option_symbol = f"{exchange_prefix}{underlying_clean}{year_2digit}{month_abbr}{strike}{option_suffix}"
             else:
                 # NSE monthly format: NSE:NIFTY25NOV25500CE
                 # Extract month abbreviation (3 letters: JAN, FEB, MAR, etc.)
@@ -446,7 +737,7 @@ def generate_option_symbol(underlying, expiry_date, strike, option_type, expiry_
         print(f"Error generating option symbol: {e}")
         return None
 
-def calculate_iv_pyvollib(option_price, underlying_price, strike, time_to_expiry, risk_free_rate=0.1, option_type='c'):
+def calculate_iv_pyvollib(option_price, underlying_price, strike, time_to_expiry, risk_free_rate=0.06, option_type='c'):
     """
     Calculate Implied Volatility using py_vollib Black model (for options on futures)
     
@@ -458,7 +749,7 @@ def calculate_iv_pyvollib(option_price, underlying_price, strike, time_to_expiry
     - underlying_price: Current futures/forward price (F) - NOT spot price
     - strike: Strike price (K)
     - time_to_expiry: Time to expiration in years (t)
-    - risk_free_rate: Risk-free interest rate (r), default 0.1 (10%)
+    - risk_free_rate: Risk-free interest rate (r), default 0.06 (6% = typical Indian risk-free rate)
     - option_type: 'c' for call, 'p' for put
     
     Returns: Implied volatility as decimal (e.g., 0.20 for 20%)
@@ -481,7 +772,8 @@ def calculate_iv_pyvollib(option_price, underlying_price, strike, time_to_expiry
     try:
         # py_vollib.black.implied_volatility expects:
         # implied_volatility(price, F, K, r, t, flag)
-        # Note: r and t are in different order than Black-Scholes!
+        # Where: price = option price, F = futures price, K = strike, r = risk-free rate, t = time to expiry, flag = 'c' or 'p'
+        # Note: This is the Black model (for options on futures), not Black-Scholes
         iv = implied_volatility(
             float(option_price),
             float(underlying_price),  # F = futures/forward price
@@ -490,6 +782,13 @@ def calculate_iv_pyvollib(option_price, underlying_price, strike, time_to_expiry
             float(time_to_expiry),    # t = time to expiry in years
             option_type               # flag = 'c' or 'p'
         )
+        
+        # Debug logging for IV calculation
+        if iv and (iv > 0.5 or iv < 0.01):  # Log if IV seems unusual
+            print(f"  IV Calculation Debug: option_price={option_price:.2f}, future_price={underlying_price:.2f}, "
+                  f"strike={strike:.2f}, time_to_expiry={time_to_expiry:.4f}, risk_free_rate={risk_free_rate:.4f}, "
+                  f"IV={iv:.4f} ({iv*100:.2f}%)")
+        
         return iv
     except Exception as e:
         # Suppress expected errors for options priced below intrinsic value
@@ -516,15 +815,18 @@ def safe_fetch_ohlc(symbol, timeframe):
         return df
     except KeyError as e:
         # Handle case where API response doesn't have 'candles' key
-        print(f"API response error for {symbol}: Missing 'candles' key in response")
-        print(f"Full error: {e}")
+        error_msg = f"API response error for {symbol}: Missing 'candles' key in response"
+        print(f"{error_msg}\nFull error: {e}")
+        add_log('ERROR', error_msg, {'symbol': symbol, 'error': str(e), 'error_type': 'KeyError'})
         return None
     except Exception as e:
-        print(f"Error fetching OHLC data for {symbol}: {e}")
+        error_msg = f"Error fetching OHLC data for {symbol}"
+        print(f"{error_msg}: {e}")
+        add_log('ERROR', error_msg, {'symbol': symbol, 'error': str(e), 'error_type': type(e).__name__})
         return None
 
-def calculate_iv(df, window=20, timeframe='1D', symbol=None, risk_free_rate=0.1, 
-                manual_strike=None, manual_expiry=None, manual_option_type=None):
+def calculate_iv(df, window=20, timeframe='1D', symbol=None, risk_free_rate=0.06, 
+                manual_strike=None, manual_expiry=None, manual_option_type=None, manual_future_symbol=None):
     """
     Calculate Implied Volatility using py_vollib Black model (for options) or Historical Volatility (for underlying)
     
@@ -534,8 +836,9 @@ def calculate_iv(df, window=20, timeframe='1D', symbol=None, risk_free_rate=0.1,
     
     Parameters:
     - manual_strike: Optional manual strike price (overrides parsed value)
-    - manual_expiry: Optional manual expiry datetime string (overrides parsed value)
+    - manual_expiry: Optional manual expiry datetime string (overrides parsed value) - used for option symbol and time_to_expiry calculation
     - manual_option_type: Optional manual option type 'c' or 'p' (overrides parsed value)
+    - manual_future_symbol: Optional future symbol (from SymbolSetting.csv). If provided, uses this instead of reconstructing from option expiry
     
     For Underlying Assets (fallback):
     - Uses rolling standard deviation of log returns (Historical Volatility)
@@ -565,18 +868,34 @@ def calculate_iv(df, window=20, timeframe='1D', symbol=None, risk_free_rate=0.1,
                     # Try ISO format
                     expiry_date = datetime.fromisoformat(manual_expiry.replace('Z', '+00:00'))
                 except:
-                    print(f"Could not parse expiry date: {manual_expiry}")
+                    try:
+                        # Try date-only format: "YYYY-MM-DD"
+                        expiry_date = datetime.strptime(manual_expiry, '%Y-%m-%d')
+                    except:
+                        print(f"Could not parse expiry date: {manual_expiry}")
         
-        # Extract underlying symbol
+        # Extract underlying symbol and determine exchange
         underlying = None
+        is_mcx_underlying = False
         if parsed_info:
             underlying = parsed_info['underlying']
+            is_mcx_underlying = parsed_info.get('is_mcx', False)
         elif ':' in symbol:
-            # Extract from format like "NSE:RELIANCE-EQ"
+            # Extract from format like "NSE:RELIANCE-EQ" or "MCX:CRUDEOILM..."
+            exchange_part = symbol.split(':')[0]
+            is_mcx_underlying = (exchange_part.upper() == 'MCX')
             underlying = symbol.split(':')[-1].split('-')[0]
         else:
             # Use symbol as-is, but try to remove option suffixes
             underlying = symbol.replace('CE', '').replace('PE', '').rstrip('0123456789')
+        
+        # If expiry_date was parsed but doesn't have correct time (midnight or not set), adjust it
+        if expiry_date and (expiry_date.hour == 0 and expiry_date.minute == 0):
+            # Time was not specified, set based on exchange
+            if is_mcx_underlying:
+                expiry_date = expiry_date.replace(hour=23, minute=20, second=0)  # 11:20 PM IST for MCX
+            else:
+                expiry_date = expiry_date.replace(hour=15, minute=15, second=0)  # 3:15 PM IST for NSE
         
         option_info = {
             'underlying': underlying if underlying else symbol,
@@ -600,14 +919,23 @@ def calculate_iv(df, window=20, timeframe='1D', symbol=None, risk_free_rate=0.1,
         print(f"  Strike: {option_info['strike']}, Type: {option_info['option_type']}, Expiry: {option_info['expiry_date']}")
         
         underlying_symbol = option_info['underlying']
-        expiry_date = option_info['expiry_date']
+        expiry_date = option_info['expiry_date']  # Option expiry (used for option symbol and time_to_expiry calculation)
         
         # Normalize expiry_date to timezone-naive to avoid timezone mismatch errors
         if expiry_date.tzinfo is not None:
             expiry_date = expiry_date.replace(tzinfo=None)
         
-        # Get future symbol for NIFTY or BANKNIFTY
-        future_symbol = get_future_symbol(underlying_symbol, expiry_date)
+        # Get future symbol - use manual_future_symbol if provided (from SymbolSetting.csv)
+        # Otherwise, reconstruct from underlying and option expiry (may be wrong if option expiry != future expiry)
+        if manual_future_symbol:
+            future_symbol = manual_future_symbol
+            print(f"  Using provided future symbol: {future_symbol} (from SymbolSetting.csv)")
+        else:
+            # Fallback: reconstruct future symbol from underlying and option expiry
+            # NOTE: This may be incorrect if option expiry != future expiry
+            future_symbol = get_future_symbol(underlying_symbol, expiry_date)
+            print(f"  WARNING: Reconstructing future symbol from option expiry - may be incorrect if option expiry != future expiry")
+            print(f"  Reconstructed future symbol: {future_symbol}")
         
         if future_symbol:
             print(f"  Using future symbol: {future_symbol}")
@@ -655,7 +983,31 @@ def calculate_iv(df, window=20, timeframe='1D', symbol=None, risk_free_rate=0.1,
                                 row_date = row_date.replace(tzinfo=None)
                             
                             # expiry_date is already normalized to naive above, so we can use it directly
-                            time_to_expiry = (expiry_date - row_date).total_seconds() / (365.25 * 24 * 3600)
+                            # Calculate time to expiry in years using option expiry
+                            # Indian brokers typically use calendar days (365) for time to expiry calculation
+                            # However, some use trading days (252). We'll use calendar days as it's more standard.
+                            time_diff = expiry_date - row_date
+                            total_seconds = time_diff.total_seconds()
+                            
+                            # Convert to years using calendar days (365 days per year)
+                            # This is the standard approach used by most Indian brokers
+                            # Note: Using 365.25 accounts for leap years, but 365 is more common in options pricing
+                            time_to_expiry = total_seconds / (365.0 * 24 * 3600)
+                            
+                            # Ensure time to expiry is reasonable (not negative, not too large)
+                            if time_to_expiry <= 0:
+                                iv_values.append(np.nan)
+                                continue
+                            if time_to_expiry > 2.0:  # More than 2 years seems wrong
+                                print(f"  Warning: Time to expiry seems too large: {time_to_expiry:.4f} years")
+                                iv_values.append(np.nan)
+                                continue
+                            
+                            # Alternative: Use trading days (more accurate for options)
+                            # trading_days_per_year = 252
+                            # calendar_days = time_diff.days
+                            # trading_days = calendar_days * (trading_days_per_year / 365.25)
+                            # time_to_expiry = trading_days / trading_days_per_year
                             
                             if time_to_expiry > 0:
                                 # Calculate IV using py_vollib Black model with historical future price
@@ -797,7 +1149,7 @@ def calculate_iv(df, window=20, timeframe='1D', symbol=None, risk_free_rate=0.1,
     
     return df
 
-def fetch_data_loop_automatic(future_symbol, expiry_date, expiry_type, option_type, timeframe, strike_distance, risk_free_rate=0.1):
+def fetch_data_loop_automatic(future_symbol, expiry_date, expiry_type, option_type, timeframe, strike_distance, risk_free_rate=0.07):
     """
     Continuously fetch data in automatic mode:
     1. Get future LTP
@@ -805,6 +1157,8 @@ def fetch_data_loop_automatic(future_symbol, expiry_date, expiry_type, option_ty
     3. Generate option symbol
     4. Fetch option data and calculate IV
     5. Repeat every 1 second
+    
+    Only fetches data during market hours (NSE: 9:15-15:30, MCX: 9:00-23:30)
     """
     global iv_data_store, fetching_status
     
@@ -818,6 +1172,9 @@ def fetch_data_loop_automatic(future_symbol, expiry_date, expiry_type, option_ty
     
     # Detect MCX contracts
     is_mcx = (exchange_part and exchange_part.upper() == 'MCX') or 'MCX:' in future_symbol.upper()
+    
+    # Determine exchange for market hours check
+    exchange = 'MCX' if is_mcx else 'NSE'
     
     underlying = None
     if is_mcx:
@@ -850,12 +1207,23 @@ def fetch_data_loop_automatic(future_symbol, expiry_date, expiry_type, option_ty
             underlying = 'NIFTY'
     
     if not underlying:
-        print(f"Error: Could not extract underlying from {future_symbol}")
+        error_msg = f"Could not extract underlying from {future_symbol}"
+        print(f"Error: {error_msg}")
+        add_log('ERROR', error_msg, {'future_symbol': future_symbol})
         return
+    
+    # Determine exchange for market hours check
+    exchange = 'MCX' if is_mcx else 'NSE'
     
     iteration = 0
     while fetching_status["active"] and fetching_status.get("mode") == "automatic":
         try:
+            # Check if market is open before fetching data
+            if not is_market_open(symbol=future_symbol, exchange=exchange):
+                print(f"Market is closed for {exchange}. Waiting 60 seconds before checking again...")
+                time.sleep(60)  # Wait 60 seconds before checking again
+                continue
+            
             iteration += 1
             print(f"\n=== Automatic Mode Iteration {iteration} ===")
             
@@ -885,7 +1253,9 @@ def fetch_data_loop_automatic(future_symbol, expiry_date, expiry_type, option_ty
             
             print(f"ATM Strike: {atm_strike}")
             
-            # Generate option symbol (with MCX: prefix for MCX contracts)
+            # Generate option symbol using OPTION expiry date (from web input, not future expiry)
+            # future_symbol already has the correct future expiry from SymbolSetting.csv
+            # expiry_date parameter is the OPTION expiry date from web input
             symbol = generate_option_symbol(underlying, expiry_date, atm_strike, option_type, expiry_type, is_mcx=is_mcx)
             if not symbol:
                 print(f"Could not generate option symbol. Retrying in 5 seconds...")
@@ -902,11 +1272,14 @@ def fetch_data_loop_automatic(future_symbol, expiry_date, expiry_type, option_ty
             df = safe_fetch_ohlc(symbol, timeframe)
             
             if df is None or len(df) == 0:
-                print(f"Failed to fetch data for {symbol}. Retrying in 5 seconds...")
+                error_msg = f"Failed to fetch data for {symbol}"
+                print(f"{error_msg}. Retrying in 5 seconds...")
+                add_log('WARNING', error_msg, {'symbol': symbol, 'iteration': iteration, 'action': 'retrying'})
                 time.sleep(5)
                 continue
             
-            # Calculate IV
+            # Calculate IV - pass the correct future_symbol from SymbolSetting.csv
+            # Option expiry is used for time_to_expiry calculation
             df_with_iv = calculate_iv(
                 df.copy(),
                 window=20,
@@ -914,8 +1287,9 @@ def fetch_data_loop_automatic(future_symbol, expiry_date, expiry_type, option_ty
                 symbol=symbol,
                 risk_free_rate=risk_free_rate,
                 manual_strike=atm_strike,
-                manual_expiry=expiry_date.isoformat(),
-                manual_option_type=option_type
+                manual_expiry=expiry_date.isoformat(),  # Option expiry (used for option symbol and time_to_expiry calculation)
+                manual_option_type=option_type,
+                manual_future_symbol=future_symbol  # Pass the correct future symbol from SymbolSetting.csv
             )
             
             if df_with_iv is not None and 'iv' in df_with_iv.columns:
@@ -959,12 +1333,21 @@ def fetch_data_loop_automatic(future_symbol, expiry_date, expiry_type, option_ty
             traceback.print_exc()
             time.sleep(5)  # Wait before retrying on error
 
-def fetch_data_loop(symbol, timeframe, manual_strike=None, manual_expiry=None, manual_option_type=None, risk_free_rate=0.1):
-    """Continuously fetch historical data and calculate IV"""
+def fetch_data_loop(symbol, timeframe, manual_strike=None, manual_expiry=None, manual_option_type=None, risk_free_rate=0.07):
+    """
+    Continuously fetch historical data and calculate IV
+    Only fetches data during market hours (NSE: 9:15-15:30, MCX: 9:00-23:30)
+    """
     global iv_data_store, fetching_status
     
     while fetching_status["active"] and fetching_status["symbol"] == symbol and fetching_status["timeframe"] == timeframe:
         try:
+            # Check if market is open before fetching data
+            if not is_market_open(symbol=symbol):
+                print(f"Market is closed for {symbol}. Waiting 60 seconds before checking again...")
+                time.sleep(60)  # Wait 60 seconds before checking again
+                continue
+            
             # Check if fyers is available
             if FyresIntegration.fyers is None:
                 print("Fyers not initialized. Waiting...")
@@ -975,11 +1358,17 @@ def fetch_data_loop(symbol, timeframe, manual_strike=None, manual_expiry=None, m
             df = safe_fetch_ohlc(symbol, timeframe)
             
             if df is None:
-                print(f"Failed to fetch data for {symbol}. This might be due to:")
+                error_msg = f"Failed to fetch data for {symbol}"
+                print(f"{error_msg}. This might be due to:")
                 print("  - Invalid symbol format")
                 print("  - Insufficient historical data available")
                 print("  - API rate limiting")
                 print("  - Symbol not supported for the selected timeframe")
+                add_log('ERROR', error_msg, {
+                    'symbol': symbol,
+                    'timeframe': timeframe,
+                    'possible_reasons': ['Invalid symbol format', 'Insufficient historical data', 'API rate limiting', 'Symbol not supported']
+                })
                 time.sleep(5)
                 continue
             
@@ -1065,16 +1454,29 @@ def login():
         
         print("Starting automated login...")
         # Perform automated login
-        automated_login(
-            client_id=credentials.get('client_id'),
-            secret_key=credentials.get('secret_key'),
-            FY_ID=credentials.get('FY_ID'),
-            TOTP_KEY=credentials.get('totpkey'),
-            PIN=credentials.get('PIN'),
-            redirect_uri=credentials.get('redirect_uri')
-        )
+        try:
+            automated_login(
+                client_id=credentials.get('client_id'),
+                secret_key=credentials.get('secret_key'),
+                FY_ID=credentials.get('FY_ID'),
+                TOTP_KEY=credentials.get('totpkey'),
+                PIN=credentials.get('PIN'),
+                redirect_uri=credentials.get('redirect_uri')
+            )
+            print("automated_login() completed without exception")
+        except Exception as login_error:
+            error_msg = f"Error in automated_login(): {login_error}"
+            print(error_msg)
+            import traceback
+            traceback.print_exc()
+            # Check if fyers was still set despite the error
+            if FyresIntegration.fyers is None:
+                return jsonify({"success": False, "message": f"Login failed: {str(login_error)}"}), 500
         
         print("Login process completed, checking fyers object...")
+        print(f"FyresIntegration.fyers type: {type(FyresIntegration.fyers)}")
+        print(f"FyresIntegration.fyers value: {FyresIntegration.fyers}")
+        
         # Check if login was successful
         if FyresIntegration.fyers is not None:
             try:
@@ -1136,7 +1538,7 @@ def start_fetching():
     data = request.json
     mode = data.get('mode', 'manual')  # 'manual' or 'automatic'
     timeframe = data.get('timeframe')
-    risk_free_rate = data.get('risk_free_rate', 0.10)  # Default 10% (0.10)
+    risk_free_rate = data.get('risk_free_rate', 0.07)  # Default 7% (0.07) = 91-day Indian T-Bill yield
     
     if not timeframe:
         return jsonify({"success": False, "message": "Timeframe is required"}), 400
@@ -1158,38 +1560,42 @@ def start_fetching():
         fetching_status["active"] = False
         time.sleep(1)  # Wait for thread to stop
     
-    # Clear old data: delete previous symbol's CSV file and clear iv_data_store
-    print("Clearing old data before starting new fetch...")
-    if old_symbol:
-        deleted_count = delete_csv_files(old_symbol)  # Delete old symbol's CSV file
-        if old_symbol in iv_data_store:
-            del iv_data_store[old_symbol]
-            print(f"Cleared IV data store for old symbol: {old_symbol}")
+    # Clear only in-memory data (keep ALL CSV files for display during fetching)
+    # CSV files will be deleted ONLY when user clicks "Stop Fetching"
+    if old_symbol and old_symbol in iv_data_store:
+        del iv_data_store[old_symbol]
+        print(f"Cleared IV data store for old symbol: {old_symbol}")
     
-    # Clear any other symbols in the store
+    # Clear any other symbols in the store (but keep ALL CSV files)
     iv_data_store.clear()
-    print("Cleared all IV data from memory")
+    print("Cleared in-memory data (CSV files preserved for display - will be deleted on Stop)")
     
     if mode == 'automatic':
         # Automatic mode: Generate option symbol from future symbol
+        # IMPORTANT: future_symbol comes from SymbolSetting.csv (with future expiry)
+        #            expiry_date_str is the OPTION expiry from web input (different from future expiry)
         future_symbol = data.get('future_symbol')
         expiry_type = data.get('expiry_type', 'weekly')  # 'weekly' or 'monthly'
-        expiry_date_str = data.get('expiry_date')
+        expiry_date_str = data.get('expiry_date')  # This is OPTION expiry, not future expiry
         option_type = data.get('option_type', 'c')  # 'c' for Call, 'p' for Put
         
         if not future_symbol or not expiry_date_str:
-            return jsonify({"success": False, "message": "Future symbol and expiry date are required for automatic mode"}), 400
+            return jsonify({"success": False, "message": "Future symbol and option expiry date are required for automatic mode"}), 400
+        
+        # Validate that future_symbol is correctly formatted (should come from SymbolSetting.csv)
+        if ':' not in future_symbol or 'FUT' not in future_symbol:
+            return jsonify({"success": False, "message": f"Invalid future symbol format: {future_symbol}. Should be like MCX:SILVER25DECFUT"}), 400
         
         try:
-            # Parse expiry date
-            expiry_date = datetime.strptime(expiry_date_str, '%Y-%m-%d')
+            # Parse OPTION expiry date (from web input, not from SymbolSetting.csv)
+            option_expiry_date = datetime.strptime(expiry_date_str, '%Y-%m-%d')
         except:
             try:
-                expiry_date = datetime.fromisoformat(expiry_date_str.replace('Z', '+00:00'))
-                if expiry_date.tzinfo:
-                    expiry_date = expiry_date.replace(tzinfo=None)
+                option_expiry_date = datetime.fromisoformat(expiry_date_str.replace('Z', '+00:00'))
+                if option_expiry_date.tzinfo:
+                    option_expiry_date = option_expiry_date.replace(tzinfo=None)
             except:
-                return jsonify({"success": False, "message": "Invalid expiry date format"}), 400
+                return jsonify({"success": False, "message": "Invalid option expiry date format"}), 400
         
         # Extract underlying from future symbol (e.g., "NSE:NIFTY25NOVFUT" -> "NIFTY", "MCX:CRUDEOILM" -> "CRUDEOIL")
         if ':' in future_symbol:
@@ -1267,18 +1673,18 @@ def start_fetching():
         if atm_strike is None:
             return jsonify({"success": False, "message": "Could not calculate ATM strike"}), 400
         
-        # Generate option symbol (with MCX: prefix for MCX contracts)
-        symbol = generate_option_symbol(underlying, expiry_date, atm_strike, option_type, expiry_type, is_mcx=is_mcx)
+        # Generate option symbol using OPTION expiry date (from web input, not future expiry)
+        # future_symbol already has the correct future expiry from SymbolSetting.csv
+        # option_expiry_date is the OPTION expiry date from web input
+        symbol = generate_option_symbol(underlying, option_expiry_date, atm_strike, option_type, expiry_type, is_mcx=is_mcx)
         
         if not symbol:
             return jsonify({"success": False, "message": "Could not generate option symbol"}), 400
         
-        print(f"Automatic mode: Generated option symbol {symbol} from future {future_symbol} (LTP: {future_ltp}, ATM Strike: {atm_strike})")
+        print(f"Automatic mode: Future symbol {future_symbol} (from SymbolSetting.csv), Option symbol {symbol} (expiry: {option_expiry_date.strftime('%Y-%m-%d')}), LTP: {future_ltp}, ATM Strike: {atm_strike}")
         
-        # Delete new symbol's CSV file to ensure fresh data
-        if symbol and symbol != old_symbol:
-            delete_csv_files(symbol)
-            print(f"Deleted CSV file for new symbol: {symbol}")
+        # Don't delete CSV files here - let them persist for display
+        # CSV files will be deleted when user clicks "Stop Fetching"
         
         # Start new fetching with generated symbol
         fetching_status = {
@@ -1286,18 +1692,21 @@ def start_fetching():
             "symbol": symbol,
             "timeframe": timeframe,
             "mode": "automatic",
-            "future_symbol": future_symbol,
+            "future_symbol": future_symbol,  # Future expiry from SymbolSetting.csv
             "expiry_type": expiry_type,
-            "expiry_date": expiry_date_str,
+            "expiry_date": expiry_date_str,  # Option expiry from web input
             "option_type": option_type,
             "strike": atm_strike,
-            "expiry": expiry_date.isoformat()
+            "expiry": option_expiry_date.isoformat()  # Option expiry from web input  # Option expiry from web input
         }
         
         # Start fetching in background thread with automatic mode
         # Note: strike_distance is calculated above and passed to the thread
         # Pass strike_step (or None) so the loop can use it or calculate defaults
-        thread = threading.Thread(target=fetch_data_loop_automatic, args=(future_symbol, expiry_date, expiry_type, option_type, timeframe, strike_distance, risk_free_rate), daemon=True)
+        # IMPORTANT: future_symbol has future expiry from SymbolSetting.csv, expiry_date has option expiry from web input
+        # IMPORTANT: future_symbol has future expiry from SymbolSetting.csv, option_expiry_date has option expiry from web input
+        # IMPORTANT: future_symbol has future expiry from SymbolSetting.csv, option_expiry_date has option expiry from web input
+        thread = threading.Thread(target=fetch_data_loop_automatic, args=(future_symbol, option_expiry_date, expiry_type, option_type, timeframe, strike_distance, risk_free_rate), daemon=True)
         thread.start()
         
         return jsonify({
@@ -1319,10 +1728,8 @@ def start_fetching():
         if not symbol:
             return jsonify({"success": False, "message": "Symbol is required for manual mode"}), 400
         
-        # Delete new symbol's CSV file to ensure fresh data
-        if symbol and symbol != old_symbol:
-            delete_csv_files(symbol)
-            print(f"Deleted CSV file for new symbol: {symbol}")
+        # Don't delete CSV files here - let them persist for display
+        # CSV files will be deleted when user clicks "Stop Fetching"
         
         # Start new fetching with optional parameters
         fetching_status = {
@@ -1343,10 +1750,21 @@ def start_fetching():
 
 @app.route('/api/stop_fetching', methods=['POST'])
 def stop_fetching():
-    """Stop fetching historical data"""
-    global fetching_status
+    """Stop fetching historical data (CSV files are preserved)"""
+    global fetching_status, iv_data_store
+    
+    # Stop fetching first
     fetching_status["active"] = False
-    return jsonify({"success": True, "message": "Data fetching stopped"})
+    
+    # CSV files are NOT deleted - they are preserved in data folder for future reference
+    print("Stopping fetch - CSV files will be preserved in data folder")
+    add_log('INFO', 'Data fetching stopped - CSV files preserved', {})
+    
+    # Clear all in-memory data only (CSV files remain on disk)
+    iv_data_store.clear()
+    print("Stopped fetching - in-memory data cleared, CSV files preserved")
+    
+    return jsonify({"success": True, "message": "Data fetching stopped. CSV files preserved in data folder."})
 
 @app.route('/api/get_iv_data', methods=['GET'])
 def get_iv_data():
@@ -1369,29 +1787,20 @@ def get_status():
 
 @app.route('/api/load_csv_data', methods=['GET'])
 def load_csv_data():
-    """Load IV data from CSV files in data folder"""
+    """Load IV data from CSV files in data folder with strict symbol validation"""
     try:
-        # Get list of CSV files in data folder
-        csv_files = [f for f in os.listdir(DATA_FOLDER) if f.endswith('.csv')]
-        
-        if not csv_files:
-            return jsonify({"success": False, "message": "No CSV files found in data folder"}), 404
-        
-        # Get the most recent CSV file or a specific one
+        # Symbol is REQUIRED - no auto-loading of most recent file
         symbol = request.args.get('symbol')
-        if symbol:
-            # Sanitize symbol for filename
-            safe_symbol = re.sub(r'[<>:"/\\|?*]', '_', symbol)
-            safe_symbol = safe_symbol.replace(':', '_').replace(' ', '_')
-            filename = os.path.join(DATA_FOLDER, f"{safe_symbol}.csv")
-        else:
-            # Use the most recent CSV file
-            csv_files_with_paths = [(os.path.join(DATA_FOLDER, f), os.path.getmtime(os.path.join(DATA_FOLDER, f))) for f in csv_files]
-            csv_files_with_paths.sort(key=lambda x: x[1], reverse=True)
-            filename = csv_files_with_paths[0][0]
+        if not symbol:
+            return jsonify({"success": False, "message": "Symbol parameter is required. Cannot auto-load CSV without explicit symbol."}), 400
+        
+        # Sanitize symbol for filename matching
+        safe_symbol = re.sub(r'[<>:"/\\|?*]', '_', symbol)
+        safe_symbol = safe_symbol.replace(':', '_').replace(' ', '_')
+        filename = os.path.join(DATA_FOLDER, f"{safe_symbol}.csv")
         
         if not os.path.exists(filename):
-            return jsonify({"success": False, "message": f"CSV file not found: {filename}"}), 404
+            return jsonify({"success": False, "message": f"CSV file not found for symbol: {symbol}"}), 404
         
         # Read CSV file
         df = pd.read_csv(filename)
@@ -1399,6 +1808,29 @@ def load_csv_data():
         # Ensure required columns exist
         if 'date' not in df.columns or 'iv' not in df.columns:
             return jsonify({"success": False, "message": "CSV file missing required columns (date, iv)"}), 400
+        
+        # STRICT VALIDATION: Verify CSV content matches requested symbol
+        # Check if CSV has option_name column and verify it matches
+        if 'option_name' in df.columns:
+            # Get unique option names from CSV (should all be the same)
+            csv_symbols = df['option_name'].dropna().unique()
+            if len(csv_symbols) > 0:
+                csv_symbol = str(csv_symbols[0]).strip()
+                # Compare symbols (handle both MCX: and MCX_ formats)
+                csv_symbol_normalized = csv_symbol.replace(':', '_')
+                symbol_normalized = symbol.replace(':', '_')
+                
+                if csv_symbol_normalized != symbol_normalized and csv_symbol != symbol:
+                    error_msg = f"Symbol mismatch: CSV file contains '{csv_symbol}' but requested '{symbol}'. This prevents data mixing between different symbols."
+                    print(f"ERROR: {error_msg}")
+                    return jsonify({"success": False, "message": error_msg}), 400
+        
+        # Also verify filename matches (double-check)
+        filename_symbol = os.path.basename(filename).replace('.csv', '')
+        if filename_symbol != safe_symbol:
+            error_msg = f"Filename mismatch: Expected '{safe_symbol}' but found '{filename_symbol}'"
+            print(f"ERROR: {error_msg}")
+            return jsonify({"success": False, "message": error_msg}), 400
         
         # Convert date column to datetime
         df['date'] = pd.to_datetime(df['date'])
@@ -1412,8 +1844,8 @@ def load_csv_data():
         close_prices = df['close'].tolist() if 'close' in df.columns else []
         fclose_prices = df['fclose'].tolist() if 'fclose' in df.columns else []
         
-        # Get symbol name from filename
-        symbol_name = os.path.basename(filename).replace('.csv', '')
+        # Return the original symbol (not sanitized filename) for consistency
+        print(f"Successfully loaded CSV data for symbol: {symbol} ({len(timestamps)} data points)")
         
         return jsonify({
             "success": True,
@@ -1421,7 +1853,7 @@ def load_csv_data():
             "iv_values": iv_values,
             "close_prices": close_prices,
             "fclose_prices": fclose_prices,
-            "symbol": symbol_name,
+            "symbol": symbol,  # Return original symbol, not filename
             "data_points": len(timestamps),
             "last_update": timestamps[-1] if timestamps else None
         })
@@ -1440,6 +1872,103 @@ def list_csv_files():
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 
+@app.route('/api/get_symbol_settings', methods=['GET'])
+def get_symbol_settings():
+    """Get symbol settings from CSV file for dropdown"""
+    try:
+        symbols = load_symbol_settings()
+        
+        # Generate future symbols and format for frontend
+        symbol_list = []
+        for sym in symbols:
+            future_symbol = generate_future_symbol_from_settings(
+                sym['prefix'], 
+                sym['symbol'], 
+                sym['expiry_date']
+            )
+            if future_symbol:
+                symbol_list.append({
+                    'future_symbol': future_symbol,
+                    'prefix': sym['prefix'],
+                    'symbol': sym['symbol'],
+                    'expiry_date': sym['expiry_date'].strftime('%Y-%m-%d'),
+                    'expiry_str': sym['expiry_str'],
+                    'strike_step': sym['strike_step']
+                })
+        
+        return jsonify({"success": True, "symbols": symbol_list})
+    except Exception as e:
+        error_msg = f"Error loading symbol settings: {e}"
+        add_log('ERROR', error_msg, traceback.format_exc())
+        import traceback
+        traceback.print_exc()
+        return jsonify({"success": False, "message": str(e)}), 500
+
+@app.route('/api/get_logs', methods=['GET'])
+def get_logs():
+    """Get application logs"""
+    try:
+        level_filter = request.args.get('level', None)  # Optional filter by level
+        limit = request.args.get('limit', 100, type=int)  # Limit number of logs
+        
+        logs = app_logs.copy()
+        
+        # Filter by level if specified
+        if level_filter:
+            logs = [log for log in logs if log['level'] == level_filter.upper()]
+        
+        # Return most recent logs first, limit the count
+        logs = logs[-limit:]
+        logs.reverse()  # Most recent first
+        
+        return jsonify({"success": True, "logs": logs, "total": len(app_logs)})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+@app.route('/api/clear_logs', methods=['POST'])
+def clear_logs():
+    """Clear all application logs"""
+    global app_logs
+    app_logs = []
+    add_log('INFO', 'Logs cleared by user')
+    return jsonify({"success": True, "message": "Logs cleared"})
+
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    import webbrowser
+    import threading
+    import sys
+    
+    # Prevent Cursor from auto-detecting and opening preview
+    # Set environment variable to disable auto-preview
+    os.environ['BROWSER'] = 'none'  # Disable auto-browser in some IDEs
+    
+    # Open browser after a short delay to allow server to start
+    def open_browser():
+        time.sleep(1.5)  # Wait for server to start
+        try:
+            # Open in default system browser
+            webbrowser.open('http://127.0.0.1:5000')
+        except Exception as e:
+            print(f"Could not open browser automatically: {e}")
+            print("Please manually open: http://127.0.0.1:5000")
+    
+    # Start browser in a separate thread
+    browser_thread = threading.Thread(target=open_browser)
+    browser_thread.daemon = True
+    browser_thread.start()
+    
+    print("\n" + "="*60)
+    print("IV Charts Web Application")
+    print("="*60)
+    print(f"Server starting on http://127.0.0.1:5000")
+    print(f"Opening in your default browser...")
+    print("\nTo disable Cursor's auto-preview:")
+    print("1. Go to Cursor Settings (Ctrl+,)")
+    print("2. Search for 'preview' or 'browser'")
+    print("3. Disable 'Auto Open Preview' or similar setting")
+    print("="*60 + "\n")
+    
+    # Run with use_reloader=False to prevent multiple browser opens
+    # and to reduce Cursor's auto-detection
+    app.run(debug=True, host='127.0.0.1', port=5000, use_reloader=False)
 

@@ -4,6 +4,361 @@ let series = null;
 let fetchInterval = null;
 // Store full data for crosshair tooltip (IV, option price, underlying price by timestamp)
 let chartDataMap = new Map(); // Maps timestamp (Unix seconds) to {iv, optionPrice, underlyingPrice}
+// Track current symbol to detect symbol changes
+let currentSymbol = null;
+
+// ============================================================================
+// CENTRALIZED CHART UPDATE MANAGER - Prevents race conditions and breaks
+// ============================================================================
+
+class ChartUpdateManager {
+    constructor() {
+        this.updateQueue = [];
+        this.isProcessing = false;
+        this.currentSymbol = null;
+        this.lastValidData = null; // Keep last valid data as fallback
+        this.updateLock = false;
+    }
+    
+    /**
+     * Queue a chart update - ensures only one update happens at a time
+     * @param {string} symbol - Symbol to update
+     * @param {Object} data - Data object with timestamps, iv_values, close_prices, fclose_prices
+     * @param {string} source - Source of data ('api' or 'csv')
+     */
+    async queueUpdate(symbol, data, source = 'api') {
+        // If symbol changed, clear queue and reset
+        if (symbol && symbol !== this.currentSymbol) {
+            console.log(`[ChartManager] Symbol changed: ${this.currentSymbol} -> ${symbol}, clearing queue and resetting...`);
+            this.updateQueue = [];
+            this.currentSymbol = symbol;
+            this.resetChart();
+            await this.wait(300); // Wait for reset to complete
+        }
+        
+        // Add to queue
+        this.updateQueue.push({ symbol, data, source, timestamp: Date.now() });
+        
+        // Process queue if not already processing
+        if (!this.isProcessing) {
+            this.processQueue();
+        }
+    }
+    
+    /**
+     * Process the update queue sequentially
+     */
+    async processQueue() {
+        if (this.isProcessing || this.updateQueue.length === 0) {
+            return;
+        }
+        
+        this.isProcessing = true;
+        
+        while (this.updateQueue.length > 0) {
+            const update = this.updateQueue.shift();
+            
+            try {
+                // Skip if symbol changed while in queue
+                if (update.symbol !== this.currentSymbol && this.currentSymbol !== null) {
+                    console.log(`[ChartManager] Skipping queued update for ${update.symbol} (current: ${this.currentSymbol})`);
+                    continue;
+                }
+                
+                await this.updateChart(update.symbol, update.data, update.source);
+            } catch (error) {
+                console.error(`[ChartManager] Error processing update:`, error);
+                // On error, try to restore last valid data
+                if (this.lastValidData) {
+                    console.log(`[ChartManager] Restoring last valid data due to error...`);
+                    await this.updateChart(this.currentSymbol, this.lastValidData.data, this.lastValidData.source);
+                }
+            }
+        }
+        
+        this.isProcessing = false;
+    }
+    
+    /**
+     * Validate and prepare chart data
+     */
+    validateAndPrepareData(data) {
+        if (!data || !data.timestamps || !data.iv_values) {
+            throw new Error('Invalid data structure: missing timestamps or iv_values');
+        }
+        
+        if (data.timestamps.length !== data.iv_values.length) {
+            throw new Error(`Data length mismatch: ${data.timestamps.length} timestamps vs ${data.iv_values.length} IV values`);
+        }
+        
+        const chartData = [];
+        const dataMap = new Map();
+        const seenTimes = new Set(); // Track duplicates
+        
+        for (let index = 0; index < data.timestamps.length; index++) {
+            const timestamp = data.timestamps[index];
+            const ivValue = data.iv_values[index];
+            
+            // Validate timestamp
+            if (!timestamp && timestamp !== 0) {
+                continue;
+            }
+            
+            // Convert timestamp
+            let time;
+            try {
+                time = convertToIST(timestamp);
+                if (!time || isNaN(time) || time <= 0) {
+                    continue;
+                }
+            } catch (e) {
+                continue;
+            }
+            
+            // Skip duplicates (keep last one)
+            if (seenTimes.has(time)) {
+                continue;
+            }
+            seenTimes.add(time);
+            
+            // Validate IV value
+            const parsedIv = parseFloat(ivValue);
+            if (isNaN(parsedIv) || parsedIv < 0) {
+                continue;
+            }
+            
+            // Get option and underlying prices
+            const optionPrice = data.close_prices && data.close_prices[index] !== undefined 
+                ? parseFloat(data.close_prices[index]) : null;
+            const underlyingPrice = data.fclose_prices && data.fclose_prices[index] !== undefined 
+                ? parseFloat(data.fclose_prices[index]) : null;
+            
+            // Store in data map for crosshair
+            dataMap.set(time, {
+                iv: parsedIv,
+                optionPrice: optionPrice,
+                underlyingPrice: underlyingPrice
+            });
+            
+            chartData.push({
+                time: time,
+                value: parsedIv
+            });
+        }
+        
+        // Sort by time
+        chartData.sort((a, b) => a.time - b.time);
+        
+        // Remove flat trailing segments (consecutive same values at end)
+        if (chartData.length > 2) {
+            const lastValue = chartData[chartData.length - 1].value;
+            let trailingFlatCount = 0;
+            for (let i = chartData.length - 2; i >= 0; i--) {
+                if (Math.abs(chartData[i].value - lastValue) < 0.0001) {
+                    trailingFlatCount++;
+                } else {
+                    break;
+                }
+            }
+            if (trailingFlatCount > 0 && trailingFlatCount < chartData.length) {
+                chartData.splice(-trailingFlatCount);
+            }
+        }
+        
+        if (chartData.length === 0) {
+            throw new Error('No valid data points after validation');
+        }
+        
+        return { chartData, dataMap };
+    }
+    
+    /**
+     * Update chart with validated data
+     */
+    async updateChart(symbol, data, source) {
+        // Ensure chart is initialized
+        if (!chart || !series) {
+            console.log('[ChartManager] Chart not initialized, initializing...');
+            if (!initChart()) {
+                throw new Error('Failed to initialize chart');
+            }
+            await this.wait(100);
+        }
+        
+        // Validate and prepare data
+        let validatedData;
+        try {
+            validatedData = this.validateAndPrepareData(data);
+        } catch (error) {
+            console.error(`[ChartManager] Data validation failed:`, error);
+            // If we have last valid data, use it instead of failing
+            if (this.lastValidData) {
+                console.log('[ChartManager] Using last valid data due to validation failure');
+                validatedData = this.validateAndPrepareData(this.lastValidData.data);
+                symbol = this.currentSymbol;
+            } else {
+                throw error;
+            }
+        }
+        
+        const { chartData, dataMap } = validatedData;
+        
+        // Update chart title
+        updateChartTitle(symbol);
+        this.currentSymbol = symbol;
+        
+        // Check if this is a new symbol or first load
+        const existingData = series.data();
+        const isNewSymbol = existingData.length === 0 || symbol !== this.currentSymbol;
+        
+        try {
+            if (isNewSymbol || existingData.length === 0) {
+                // New symbol: Clear and set all data
+                console.log(`[ChartManager] Setting ${chartData.length} data points for new symbol: ${symbol}`);
+                series.setData([]);
+                await this.wait(50);
+                series.setData(chartData);
+                
+                // Verify data was set
+                await this.wait(50);
+                const verifyData = series.data();
+                if (verifyData.length === 0 && chartData.length > 0) {
+                    console.warn('[ChartManager] Data not set, retrying...');
+                    series.setData(chartData);
+                }
+                
+                // Update data map
+                chartDataMap.clear();
+                dataMap.forEach((value, key) => chartDataMap.set(key, value));
+                
+                // Fit content to show all data
+                chart.timeScale().fitContent();
+                
+                // Auto-scale price scale
+                this.autoScalePriceScale(chartData);
+                
+                console.log(`[ChartManager] Successfully set ${chartData.length} data points for ${symbol}`);
+            } else {
+                // Same symbol: Incremental update (preserve zoom if user has panned)
+                const currentVisibleRange = chart.timeScale().getVisibleRange();
+                const dataLength = existingData.length;
+                
+                // Check if user is at latest point
+                let shouldPreserveZoom = true;
+                if (dataLength > 0 && currentVisibleRange && currentVisibleRange.to) {
+                    const latestDataTime = existingData[dataLength - 1].time;
+                    const visibleEndTime = typeof currentVisibleRange.to === 'number' 
+                        ? currentVisibleRange.to 
+                        : currentVisibleRange.to.getTime() / 1000;
+                    const timeDiff = Math.abs(latestDataTime - visibleEndTime);
+                    if (timeDiff <= 300) { // Within 5 minutes
+                        shouldPreserveZoom = false;
+                    }
+                }
+                
+                // Update data
+                series.setData(chartData);
+                
+                // Update data map
+                chartDataMap.clear();
+                dataMap.forEach((value, key) => chartDataMap.set(key, value));
+                
+                // Auto-scale price scale
+                this.autoScalePriceScale(chartData);
+                
+                // Preserve zoom if user has panned away
+                if (shouldPreserveZoom && currentVisibleRange) {
+                    await this.wait(50);
+                    try {
+                        chart.timeScale().setVisibleRange(currentVisibleRange);
+                    } catch (e) {
+                        console.warn('[ChartManager] Could not preserve zoom:', e);
+                    }
+                }
+                
+                console.log(`[ChartManager] Incrementally updated ${chartData.length} data points for ${symbol}`);
+            }
+            
+            // Save as last valid data
+            this.lastValidData = { symbol, data, source };
+            
+        } catch (error) {
+            console.error(`[ChartManager] Error updating chart:`, error);
+            // Try to restore last valid data
+            if (this.lastValidData && this.lastValidData.data) {
+                console.log('[ChartManager] Attempting to restore last valid data...');
+                try {
+                    const restored = this.validateAndPrepareData(this.lastValidData.data);
+                    series.setData(restored.chartData);
+                    chartDataMap.clear();
+                    restored.dataMap.forEach((value, key) => chartDataMap.set(key, value));
+                } catch (e) {
+                    console.error('[ChartManager] Failed to restore last valid data:', e);
+                }
+            }
+            throw error;
+        }
+    }
+    
+    /**
+     * Auto-scale price scale to fit data
+     */
+    autoScalePriceScale(chartData) {
+        try {
+            const values = chartData.map(d => d.value).filter(v => v != null && !isNaN(v) && v > 0);
+            if (values.length > 0) {
+                const priceScale = chart.priceScale('right');
+                if (priceScale) {
+                    priceScale.applyOptions({ autoScale: true });
+                }
+            }
+        } catch (e) {
+            console.warn('[ChartManager] Could not auto-scale price scale:', e);
+        }
+    }
+    
+    /**
+     * Reset chart completely
+     */
+    resetChart() {
+        console.log('[ChartManager] Resetting chart...');
+        
+        // Clear data map
+        if (chartDataMap) {
+            chartDataMap.clear();
+        }
+        
+        // Clear series data
+        if (series && typeof series.setData === 'function') {
+            try {
+                series.setData([]);
+            } catch (e) {
+                console.warn('[ChartManager] Error clearing series:', e);
+            }
+        }
+        
+        // Reset time scale
+        if (chart && chart.timeScale) {
+            try {
+                chart.timeScale().fitContent();
+            } catch (e) {
+                console.warn('[ChartManager] Error resetting time scale:', e);
+            }
+        }
+        
+        console.log('[ChartManager] Chart reset complete');
+    }
+    
+    /**
+     * Wait utility
+     */
+    wait(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+}
+
+// Create global chart update manager instance
+const chartUpdateManager = new ChartUpdateManager();
 
 // Helper function to convert IST timestamp string to Unix timestamp
 // CSV timestamps are in IST format: "2025-11-13 15:29:00"
@@ -240,6 +595,24 @@ function initChart() {
             lineStyle: 0,  // Solid line
             pointMarkersVisible: false,  // No markers for cleaner look
         });
+        
+        // Enable auto-scaling on the price scale (Y-axis)
+        // The price scale is automatically created and will auto-scale by default
+        // But we can configure it explicitly
+        try {
+            const priceScale = chart.priceScale('right');
+            if (priceScale) {
+                priceScale.applyOptions({
+                    autoScale: true,
+                    scaleMargins: {
+                        top: 0.1,
+                        bottom: 0.1,
+                    },
+                });
+            }
+        } catch (e) {
+            console.warn('Could not configure price scale:', e);
+        }
     
         // Enable crosshair tracking for tooltip
         chart.subscribeCrosshairMove((param) => {
@@ -350,6 +723,59 @@ function findClosestDataPoint(timestamp) {
     return null;
 }
 
+// Reset chart completely - clear all data and reset scales
+function resetChart() {
+    console.log('Resetting chart completely...');
+    
+    // Clear all data
+    if (chartDataMap) {
+        chartDataMap.clear();
+        console.log('Cleared chartDataMap');
+    }
+    
+    // Clear series data - this is critical to prevent zoom issues
+    if (series && typeof series.setData === 'function') {
+        series.setData([]);
+        console.log('Cleared series data');
+        
+        // Wait a moment to ensure clear takes effect
+        setTimeout(() => {
+            const verifyClear = series.data();
+            if (verifyClear.length > 0) {
+                console.warn('Series still has data after clear, forcing clear again...');
+                series.setData([]);
+            }
+        }, 50);
+    }
+    
+    // Reset time scale
+    if (chart) {
+        try {
+            chart.timeScale().fitContent();
+            console.log('Reset time scale (fitContent)');
+        } catch (e) {
+            console.warn('Error resetting time scale:', e);
+        }
+    }
+    
+    // Reset price scale
+    if (chart) {
+        try {
+            const priceScale = chart.priceScale('right');
+            if (priceScale) {
+                priceScale.applyOptions({
+                    autoScale: true,
+                });
+                console.log('Reset price scale (autoScale)');
+            }
+        } catch (e) {
+            console.warn('Error resetting price scale:', e);
+        }
+    }
+    
+    console.log('Chart reset complete');
+}
+
 // Update chart title with contract name
 function updateChartTitle(symbol) {
     const chartContractName = document.getElementById('chartContractName');
@@ -368,181 +794,52 @@ function updateChartTitle(symbol) {
     }
 }
 
-// Fetch IV data and update chart
+// Fetch IV data and update chart (uses ChartUpdateManager)
 async function fetchIVData(symbol) {
     try {
-        // Update chart title with current symbol
-        updateChartTitle(symbol);
+        if (!symbol) {
+            console.warn('[fetchIVData] No symbol provided');
+            return;
+        }
         
-        console.log('Fetching IV data for symbol:', symbol);
+        console.log('[fetchIVData] Fetching IV data for symbol:', symbol);
         const response = await fetch(`/api/get_iv_data?symbol=${encodeURIComponent(symbol)}`);
+        
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        
         const data = await response.json();
         
-        console.log('Received IV data:', {
-            timestamps: data.timestamps?.length || 0,
+        if (!data || !data.timestamps || data.timestamps.length === 0) {
+            console.warn('[fetchIVData] No data received or empty timestamps');
+            // Try to use last valid data if available
+            if (chartUpdateManager.lastValidData) {
+                console.log('[fetchIVData] Using last valid data as fallback');
+                await chartUpdateManager.queueUpdate(symbol, chartUpdateManager.lastValidData.data, 'api');
+            }
+            return;
+        }
+        
+        console.log('[fetchIVData] Received IV data:', {
+            timestamps: data.timestamps.length,
             iv_values: data.iv_values?.length || 0,
-            has_series: !!series
+            close_prices: data.close_prices?.length || 0,
+            fclose_prices: data.fclose_prices?.length || 0
         });
         
-        if (!series) {
-            console.warn('Chart series not initialized, attempting to initialize...');
-            // Try to initialize chart if it hasn't been initialized yet
-            if (!chart) {
-                initChart();
-            }
-            // If still no series after initialization attempt, wait a bit and retry
-            if (!series) {
-                console.error('Chart series still not initialized after attempt. Please refresh the page.');
-                return;
-            }
-        }
+        // Queue update through ChartUpdateManager (handles all validation and updates)
+        await chartUpdateManager.queueUpdate(symbol, data, 'api');
         
-        if (data.timestamps && data.timestamps.length > 0) {
-            const previousLength = series.data().length;
-            
-            console.log('Sample timestamp:', data.timestamps[0]);
-            console.log('Sample IV value:', data.iv_values[0]);
-            
-            // Convert data to TradingView format with validation
-            const chartData = data.timestamps.map((timestamp, index) => {
-                // Validate timestamp exists
-                if (!timestamp && timestamp !== 0) {
-                    return null;
-                }
-                
-                // Parse timestamp and convert to IST
-                let time;
-                try {
-                    // Convert timestamp to IST and get Unix timestamp
-                    time = convertToIST(timestamp);
-                    
-                    if (!time || isNaN(time) || time <= 0) {
-                        console.warn('Invalid timestamp after IST conversion:', timestamp);
-                        return null;
-                    }
-                } catch (e) {
-                    console.warn('Error parsing timestamp:', timestamp, e);
-                    return null;
-                }
-                
-                // Validate IV value
-                const ivValue = parseFloat(data.iv_values[index]);
-                if (isNaN(ivValue) || ivValue < 0) {
-                    console.warn('Invalid IV value at index', index, ':', data.iv_values[index]);
-                    return null;
-                }
-                
-                // Get option price and underlying price for this timestamp
-                const optionPrice = data.close_prices && data.close_prices[index] !== undefined ? parseFloat(data.close_prices[index]) : null;
-                const underlyingPrice = data.fclose_prices && data.fclose_prices[index] !== undefined ? parseFloat(data.fclose_prices[index]) : null;
-                
-                // Store in data map for crosshair tooltip
-                chartDataMap.set(time, {
-                    iv: ivValue,
-                    optionPrice: optionPrice,
-                    underlyingPrice: underlyingPrice
-                });
-                
-                return {
-                    time: time,
-                    value: ivValue,
-                };
-            }).filter(item => item !== null && item.time > 0 && !isNaN(item.time) && !isNaN(item.value) && item.value >= 0); // Remove null entries and validate
-            
-            console.log(`Updating chart with ${chartData.length} data points (previous: ${previousLength})`);
-            console.log('First data point:', chartData[0]);
-            console.log('Last data point:', chartData[chartData.length - 1]);
-            
-            if (chartData.length > 0) {
-                // Sort data by time to ensure proper line rendering
-                chartData.sort((a, b) => a.time - b.time);
-                
-                // Update series data - TradingView expects array of {time, value}
-                try {
-                    console.log('Setting chart data...', chartData.length, 'points');
-                    if (chartData.length > 0) {
-                        console.log('Sample data point:', JSON.stringify(chartData[0]));
-                    }
-                    
-                    // Validate series exists and is ready
-                    if (!series || typeof series.setData !== 'function') {
-                        console.error('Series is not ready or setData is not a function');
-                        return;
-                    }
-                    
-                    // Check if we have existing data to determine update strategy
-                    const existingData = series.data();
-                    const hasExistingData = existingData && existingData.length > 0;
-                    
-                    if (hasExistingData && previousLength > 0) {
-                        // Incremental update: Preserve current zoom when updating data
-                        const currentVisibleRange = chart.timeScale().getVisibleRange();
-                        const dataLength = series.data().length;
-                        const isAtLatestPoint = dataLength > 0 && currentVisibleRange && currentVisibleRange.to;
-                        
-                        // Check if user is viewing the latest point (within 5 minutes tolerance)
-                        let shouldPreserveZoom = true;
-                        if (isAtLatestPoint && dataLength > 0) {
-                            const latestDataTime = series.data()[dataLength - 1].time;
-                            const visibleEndTime = typeof currentVisibleRange.to === 'number' ? currentVisibleRange.to : currentVisibleRange.to.getTime() / 1000;
-                            const timeDiff = Math.abs(latestDataTime - visibleEndTime);
-                            // If user is within 5 minutes of latest point, allow auto-scroll
-                            if (timeDiff <= 300) {
-                                shouldPreserveZoom = false;
-                            }
-                        }
-                        
-                        // Update all data
-                        series.setData(chartData);
-                        
-                        // Restore the previous visible range to preserve zoom only if user has panned away
-                        if (shouldPreserveZoom && currentVisibleRange && currentVisibleRange.from && currentVisibleRange.to) {
-                            setTimeout(() => {
-                                try {
-                                    chart.timeScale().setVisibleRange(currentVisibleRange);
-                                    console.log('Preserved zoom/pan position (user has panned away)');
-                                } catch (e) {
-                                    console.warn('Could not restore visible range:', e);
-                                }
-                            }, 50);
-                        } else {
-                            console.log('User at latest point - allowing auto-scroll');
-                        }
-                        console.log(`Updated chart data`);
-                    } else {
-                        // First load: Set all data and fit content
-                        series.setData(chartData);
-                        console.log(`Chart data set successfully. Series now has ${series.data().length} points`);
-                        
-                        // Only fit content on first load
-                        setTimeout(() => {
-                            chart.timeScale().fitContent();
-                            console.log('First load - fitContent called');
-                        }, 100);
-                    }
-                    
-                    console.log(`Chart updated with ${chartData.length} data points`);
-                    const values = chartData.map(d => d.value).filter(v => !isNaN(v));
-                    if (values.length > 0) {
-                        console.log(`IV range: ${Math.min(...values).toFixed(2)}% - ${Math.max(...values).toFixed(2)}%`);
-                    }
-                } catch (error) {
-                    console.error('Error setting chart data:', error);
-                    console.error('Chart data sample:', chartData.slice(0, 3));
-                    console.error('Error details:', error.message, error.stack);
-                }
-            } else {
-                console.warn('No valid IV data points to plot (all values are 0 or invalid)');
-                console.warn('Timestamps:', data.timestamps.slice(0, 3));
-                console.warn('IV values:', data.iv_values.slice(0, 3));
-            }
-        } else if (data.timestamps && data.timestamps.length === 0) {
-            console.log('Waiting for data... (no timestamps received)');
-        } else {
-            console.warn('No timestamps in response:', data);
-        }
+        // Update currentSymbol tracking
+        currentSymbol = symbol;
     } catch (error) {
-        console.error('Error fetching IV data:', error);
+        console.error('[fetchIVData] Error fetching IV data:', error);
+        // Try to use last valid data if available
+        if (chartUpdateManager.lastValidData) {
+            console.log('[fetchIVData] Using last valid data as fallback due to error');
+            await chartUpdateManager.queueUpdate(symbol, chartUpdateManager.lastValidData.data, 'api');
+        }
     }
 }
 
@@ -565,20 +862,18 @@ async function checkLoginStatus() {
 }
 
 // Login to Fyers API
-async function loginToAPI() {
-    console.log('loginToAPI function called');
-    
-    // Ensure function is globally accessible
-    if (typeof window !== 'undefined') {
-        window.loginToAPI = loginToAPI;
-    }
+// Define loginToAPI function and make it globally available immediately
+window.loginToAPI = async function loginToAPI() {
+    console.log('[loginToAPI] Function called');
     
     const btn = document.getElementById('loginBtn');
     if (!btn) {
-        console.error('Login button not found');
+        console.error('[loginToAPI] Login button not found');
         alert('Login button not found. Please refresh the page.');
         return;
     }
+    
+    console.log('[loginToAPI] Button found:', btn);
     
     // Check if already logged in
     if (btn.disabled && btn.textContent === 'Logged In') {
@@ -614,14 +909,25 @@ async function loginToAPI() {
         clearTimeout(timeoutId);
         
         console.log('Login response status:', response.status);
+        console.log('Login response headers:', response.headers);
         
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({ message: `HTTP ${response.status}: ${response.statusText}` }));
-            throw new Error(errorData.message || `HTTP ${response.status}: ${response.statusText}`);
+        // Try to get response text first for debugging
+        const responseText = await response.text();
+        console.log('Login response text:', responseText);
+        
+        let data;
+        try {
+            data = JSON.parse(responseText);
+        } catch (e) {
+            console.error('Failed to parse login response as JSON:', e);
+            throw new Error(`Invalid response from server: ${responseText.substring(0, 100)}`);
         }
         
-        const data = await response.json();
         console.log('Login response data:', data);
+        
+        if (!response.ok) {
+            throw new Error(data.message || `HTTP ${response.status}: ${response.statusText}`);
+        }
         
         if (data.success) {
             document.getElementById('loginStatus').style.display = 'flex';
@@ -652,6 +958,9 @@ async function loginToAPI() {
 
 // Start fetching data
 // Toggle between manual and automatic mode
+// Store symbol settings data
+let symbolSettingsData = [];
+
 function toggleMode() {
     const mode = document.getElementById('mode').value;
     const manualFields = document.getElementById('manualModeFields');
@@ -666,8 +975,158 @@ function toggleMode() {
     }
 }
 
-// Make toggleMode available globally
+// Load symbols from API
+async function loadSymbolSettings() {
+    try {
+        const response = await fetch('/api/get_symbol_settings');
+        const data = await response.json();
+        
+        if (data.success && data.symbols) {
+            symbolSettingsData = data.symbols;
+            populateFutureSymbolDropdown(data.symbols);
+        } else {
+            console.error('Failed to load symbol settings:', data.message);
+        }
+    } catch (error) {
+        console.error('Error loading symbol settings:', error);
+    }
+}
+
+// Populate future symbol dropdown
+function populateFutureSymbolDropdown(symbols) {
+    const dropdown = document.getElementById('futureSymbol');
+    dropdown.innerHTML = '<option value="">Select Future Symbol</option>';
+    
+    symbols.forEach(sym => {
+        const option = document.createElement('option');
+        option.value = sym.future_symbol;
+        option.textContent = sym.future_symbol;
+        option.dataset.strikeStep = sym.strike_step || '';
+        option.dataset.expiryDate = sym.expiry_date || '';
+        dropdown.appendChild(option);
+    });
+    
+    // Select first option if available
+    if (symbols.length > 0) {
+        dropdown.value = symbols[0].future_symbol;
+        onFutureSymbolChange();
+    }
+}
+
+// Handle future symbol change
+function onFutureSymbolChange() {
+    const dropdown = document.getElementById('futureSymbol');
+    const selectedOption = dropdown.options[dropdown.selectedIndex];
+    
+    if (selectedOption && selectedOption.dataset) {
+        // Auto-fill strike step
+        const strikeStep = selectedOption.dataset.strikeStep;
+        const strikeStepInput = document.getElementById('strikeStep');
+        if (strikeStep && strikeStep !== 'None' && strikeStep !== '') {
+            strikeStepInput.value = strikeStep;
+        } else {
+            strikeStepInput.value = '';
+        }
+        
+        // Auto-fill expiry date
+        const expiryDate = selectedOption.dataset.expiryDate;
+        const expiryDateInput = document.getElementById('autoExpiryDate');
+        if (expiryDate && expiryDate !== '') {
+            expiryDateInput.value = expiryDate;
+        }
+    }
+}
+
+// Load and display logs
+async function loadLogs() {
+    try {
+        const levelFilter = document.getElementById('logLevelFilter').value;
+        const url = levelFilter ? `/api/get_logs?level=${levelFilter}&limit=200` : '/api/get_logs?limit=200';
+        
+        const response = await fetch(url);
+        const data = await response.json();
+        
+        if (data.success && data.logs) {
+            displayLogs(data.logs);
+        } else {
+            console.error('Failed to load logs:', data.message);
+        }
+    } catch (error) {
+        console.error('Error loading logs:', error);
+    }
+}
+
+// Display logs in the container
+function displayLogs(logs) {
+    const container = document.getElementById('logsContainer');
+    
+    if (!logs || logs.length === 0) {
+        container.innerHTML = '<div style="color: #a0c4ff; text-align: center; padding: 20px;">No logs available</div>';
+        return;
+    }
+    
+    let html = '<div style="display: flex; flex-direction: column; gap: 8px;">';
+    
+    logs.forEach(log => {
+        const levelColor = {
+            'ERROR': '#ff6b6b',
+            'WARNING': '#ffd93d',
+            'INFO': '#6bcf7f',
+            'DEBUG': '#a0c4ff'
+        }[log.level] || '#a0c4ff';
+        
+        html += `
+            <div style="padding: 8px 12px; background: rgba(30, 58, 95, 0.3); border-left: 3px solid ${levelColor}; border-radius: 4px;">
+                <div style="display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap;">
+                    <span style="color: #888; font-size: 11px; min-width: 160px;">${log.timestamp}</span>
+                    <span style="color: ${levelColor}; font-weight: bold; min-width: 60px;">[${log.level}]</span>
+                    <span style="color: #fff; flex: 1;">${escapeHtml(log.message)}</span>
+                </div>
+                ${log.details ? `<div style="color: #888; font-size: 11px; margin-top: 4px; margin-left: 232px; white-space: pre-wrap; word-break: break-all;">${escapeHtml(log.details)}</div>` : ''}
+            </div>
+        `;
+    });
+    
+    html += '</div>';
+    container.innerHTML = html;
+    
+    // Auto-scroll to top (most recent logs)
+    container.scrollTop = 0;
+}
+
+// Clear logs
+async function clearLogs() {
+    if (!confirm('Are you sure you want to clear all logs?')) {
+        return;
+    }
+    
+    try {
+        const response = await fetch('/api/clear_logs', { method: 'POST' });
+        const data = await response.json();
+        
+        if (data.success) {
+            loadLogs();
+        } else {
+            alert('Failed to clear logs: ' + data.message);
+        }
+    } catch (error) {
+        console.error('Error clearing logs:', error);
+        alert('Error clearing logs: ' + error.message);
+    }
+}
+
+// Escape HTML to prevent XSS
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// Make functions available globally
 window.toggleMode = toggleMode;
+window.onFutureSymbolChange = onFutureSymbolChange;
+window.loadLogs = loadLogs;
+window.clearLogs = clearLogs;
 
 async function startFetching() {
     console.log('startFetching function called');
@@ -684,9 +1143,9 @@ async function startFetching() {
     const mode = modeInput.value;
     const timeframe = timeframeInput.value;
     
-    // Get risk-free rate (default 10% = 0.10)
+    // Get risk-free rate (default 7% = 0.07 = 91-day Indian T-Bill yield)
     const riskFreeRateInput = document.getElementById('riskFreeRate');
-    const riskFreeRate = riskFreeRateInput && riskFreeRateInput.value ? parseFloat(riskFreeRateInput.value) / 100 : 0.10;
+    const riskFreeRate = riskFreeRateInput && riskFreeRateInput.value ? parseFloat(riskFreeRateInput.value) / 100 : 0.07;
     
     // Build request payload
     const payload = { mode, timeframe, risk_free_rate: riskFreeRate };
@@ -799,15 +1258,26 @@ async function startFetching() {
             }
             showNotification(message, 'success');
             
-            // Clear chart data before loading new data
-            if (series) {
-                console.log('Clearing chart data before loading new symbol...');
-                series.setData([]);
-                chartDataMap.clear(); // Clear the data map
+            // Get the symbol we're about to fetch
+            const symbolToPoll = mode === 'automatic' ? data.generated_symbol : payload.symbol;
+            
+            // If symbol changed, completely reset chart
+            if (symbolToPoll && symbolToPoll !== currentSymbol) {
+                console.log(`Symbol changed from ${currentSymbol} to ${symbolToPoll} - resetting chart completely...`);
+                resetChart();
+                currentSymbol = symbolToPoll;
+                
+                // Wait a moment for reset to complete
+                await new Promise(resolve => setTimeout(resolve, 300));
+            } else if (!currentSymbol) {
+                // First time, just reset
+                console.log('First fetch - resetting chart...');
+                resetChart();
+                currentSymbol = symbolToPoll;
+                await new Promise(resolve => setTimeout(resolve, 300));
             }
             
             // Update chart title with current symbol
-            const symbolToPoll = mode === 'automatic' ? data.generated_symbol : payload.symbol;
             if (symbolToPoll) {
                 updateChartTitle(symbolToPoll);
             }
@@ -849,13 +1319,37 @@ async function stopFetching() {
         if (data.success) {
             document.getElementById('fetchStatus').textContent = 'Stopped';
             document.getElementById('fetchStatus').classList.remove('active');
-            showNotification('Data fetching stopped', 'info');
+            
+            // Clear chart data and reset
+            if (chartDataMap) {
+                chartDataMap.clear();
+            }
+            
+            // Clear series data
+            if (series && typeof series.setData === 'function') {
+                series.setData([]);
+            }
+            
+            // Reset zoom and chart scale
+            if (chart) {
+                chart.timeScale().fitContent();
+            }
+            
+            // Clear contract name display
+            const contractNameEl = document.getElementById('chartContractName');
+            if (contractNameEl) {
+                contractNameEl.textContent = '';
+            }
             
             // Stop polling
             if (fetchInterval) {
                 clearInterval(fetchInterval);
                 fetchInterval = null;
             }
+            
+            showNotification(data.message || 'Data fetching stopped and chart reset', 'info');
+        } else {
+            showNotification('Error stopping data fetch: ' + (data.message || 'Unknown error'), 'error');
         }
     } catch (error) {
         showNotification('Error stopping data fetch', 'error');
@@ -984,301 +1478,74 @@ style.textContent = `
 `;
 document.head.appendChild(style);
 
-// Load CSV data on page load
-async function loadCSVData(symbol = null) {
+// Load CSV data for a specific symbol (symbol is REQUIRED)
+async function loadCSVData(symbol) {
     try {
-        console.log('Loading CSV data...', symbol ? `for symbol: ${symbol}` : '');
-        // If symbol is provided, load that specific symbol's CSV, otherwise load most recent
-        const url = symbol ? `/api/load_csv_data?symbol=${encodeURIComponent(symbol)}` : '/api/load_csv_data';
+        if (!symbol) {
+            console.warn('[loadCSVData] Symbol is required - cannot load CSV without explicit symbol');
+            return;
+        }
+        
+        console.log('[loadCSVData] Loading CSV data for symbol:', symbol);
+        
+        // Validate symbol matches current symbol before loading
+        if (currentSymbol && currentSymbol !== symbol) {
+            console.warn(`[loadCSVData] Symbol mismatch: current=${currentSymbol}, requested=${symbol}. Resetting chart.`);
+            // ChartUpdateManager will handle the reset, but we should ensure it happens
+            resetChart();
+            currentSymbol = symbol;
+            await new Promise(resolve => setTimeout(resolve, 300));
+        }
+        
+        const url = `/api/load_csv_data?symbol=${encodeURIComponent(symbol)}`;
         const response = await fetch(url);
+        
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({ message: response.statusText }));
+            throw new Error(errorData.message || `HTTP ${response.status}: ${response.statusText}`);
+        }
+        
         const data = await response.json();
         
-        if (data.success && data.timestamps && data.timestamps.length > 0) {
-            console.log(`Loaded ${data.data_points} data points from CSV for symbol: ${data.symbol}`);
-            
-            // Update chart title with symbol from CSV
-            if (data.symbol) {
-                updateChartTitle(data.symbol);
-            }
-            
-            // Ensure chart is initialized
-            if (!chart || !series) {
-                console.log('Chart not initialized, initializing now...');
-                if (!initChart()) {
-                    console.error('Failed to initialize chart');
-                    return;
-                }
-            }
-            
-            // Wait a bit for chart to be ready
-            await new Promise(resolve => setTimeout(resolve, 100));
-            
-            // Convert CSV data to chart format and plot
-            const chartData = [];
-            
-            for (let index = 0; index < data.timestamps.length; index++) {
-                const timestamp = data.timestamps[index];
-                const ivValue = data.iv_values[index];
-                
-                // Skip if timestamp or IV value is missing
-                if (!timestamp || ivValue === null || ivValue === undefined) {
-                    continue;
-                }
-                
-                let time;
-                try {
-                    // Convert timestamp to IST and get Unix timestamp
-                    time = convertToIST(timestamp);
-                    
-                    // Debug: Log first few conversions to verify
-                    if (index < 3 || index === data.timestamps.length - 1) {
-                        const testDate = new Date(time * 1000);
-                        console.log(`CSV Timestamp: ${timestamp} -> Unix: ${time} -> Display: ${testDate.toLocaleString('en-IN', {timeZone: 'Asia/Kolkata'})}`);
-                    }
-                    
-                    // Validate time is valid
-                    if (!time || time <= 0 || isNaN(time)) {
-                        continue;
-                    }
-                } catch (e) {
-                    continue; // Skip on error
-                }
-                
-                // Validate IV value
-                const parsedIv = parseFloat(ivValue);
-                if (isNaN(parsedIv) || parsedIv < 0) {
-                    continue;
-                }
-                
-                // Get option price and underlying price for this timestamp
-                const optionPrice = data.close_prices && data.close_prices[index] !== undefined ? parseFloat(data.close_prices[index]) : null;
-                const underlyingPrice = data.fclose_prices && data.fclose_prices[index] !== undefined ? parseFloat(data.fclose_prices[index]) : null;
-                
-                // Store in data map for crosshair tooltip
-                chartDataMap.set(time, {
-                    iv: parsedIv,
-                    optionPrice: optionPrice,
-                    underlyingPrice: underlyingPrice
-                });
-                
-                // Create data point - ensure both time and value are valid numbers
-                const dataPoint = {
-                    time: time,
-                    value: parsedIv
-                };
-                
-                // Final validation before adding
-                if (dataPoint.time && dataPoint.value && 
-                    !isNaN(dataPoint.time) && !isNaN(dataPoint.value) &&
-                    dataPoint.time > 0 && dataPoint.value >= 0) {
-                    chartData.push(dataPoint);
-                }
-            }
-            
-            console.log(`Validated ${chartData.length} data points from ${data.timestamps.length} total points`);
-            
-            // Debug: Check first few data points
-            if (chartData.length > 0) {
-                console.log('Sample data points:', chartData.slice(0, 3));
-                console.log('Last data points:', chartData.slice(-3));
-                
-                // Check for any null/undefined values
-                const hasNulls = chartData.some(item => item === null || item === undefined || item.time === null || item.value === null);
-                if (hasNulls) {
-                    console.warn('WARNING: Found null values in chartData!');
-                    const nullItems = chartData.filter(item => item === null || item === undefined || item.time === null || item.value === null);
-                    console.warn('Null items:', nullItems);
-                }
-            }
-            
-            if (chartData.length > 0) {
-                // Validate series exists
-                if (!series || typeof series.setData !== 'function') {
-                    console.error('Series is not ready for CSV data');
-                    return;
-                }
-                
-                // Sort data by time to ensure proper rendering
-                chartData.sort((a, b) => {
-                    if (a.time !== b.time) {
-                        return a.time - b.time;
-                    }
-                    // If timestamps are equal, sort by value (for deduplication)
-                    return a.value - b.value;
-                });
-                
-                // Final validation - remove any remaining invalid entries
-                let finalData = chartData.filter(item => {
-                    return item && 
-                           typeof item.time === 'number' && 
-                           typeof item.value === 'number' &&
-                           !isNaN(item.time) && 
-                           !isNaN(item.value) &&
-                           item.time > 0 && 
-                           item.value >= 0;
-                });
-                
-                // CRITICAL FIX: Remove duplicate timestamps
-                // The library throws "Value is null" errors when there are duplicate timestamps
-                // We'll keep only the last value for each unique timestamp
-                const uniqueData = new Map();
-                for (const item of finalData) {
-                    // If timestamp already exists, keep the one with the later index (more recent)
-                    if (!uniqueData.has(item.time)) {
-                        uniqueData.set(item.time, item);
-                    } else {
-                        // Replace with current item (since data is sorted, this keeps the last occurrence)
-                        uniqueData.set(item.time, item);
-                    }
-                }
-                
-                // Convert Map back to array and sort
-                finalData = Array.from(uniqueData.values()).sort((a, b) => a.time - b.time);
-                
-                console.log(`After deduplication: ${finalData.length} points (removed ${chartData.length - finalData.length} duplicates)`);
-                
-                // Remove flat line segments - filter out consecutive points with the same value
-                // This removes the flat horizontal line that appears when data stops changing
-                const filteredData = [];
-                const MIN_VALUE_CHANGE = 0.0001; // Minimum change to consider significant
-                
-                for (let i = 0; i < finalData.length; i++) {
-                    const current = finalData[i];
-                    const previous = filteredData[filteredData.length - 1];
-                    
-                    // Always keep the first point
-                    if (filteredData.length === 0) {
-                        filteredData.push(current);
-                        continue;
-                    }
-                    
-                    // Keep point if value changed significantly OR if time gap is large (new day/session)
-                    const valueChanged = Math.abs(current.value - previous.value) >= MIN_VALUE_CHANGE;
-                    const timeGap = current.time - previous.time;
-                    const largeTimeGap = timeGap > 3600; // More than 1 hour gap
-                    
-                    if (valueChanged || largeTimeGap) {
-                        filteredData.push(current);
-                    }
-                    // Otherwise, skip this point (same value as previous)
-                }
-                
-                // Also remove trailing flat segments (where last N points all have the same value)
-                // This handles cases where data collection stopped but same value keeps repeating
-                if (filteredData.length > 10) {
-                    const lastValue = filteredData[filteredData.length - 1].value;
-                    let flatSegmentStart = filteredData.length - 1;
-                    
-                    // Find where the flat segment starts
-                    for (let i = filteredData.length - 2; i >= 0; i--) {
-                        if (Math.abs(filteredData[i].value - lastValue) < MIN_VALUE_CHANGE) {
-                            flatSegmentStart = i;
-                        } else {
-                            break;
-                        }
-                    }
-                    
-                    // If flat segment is more than 10% of data, remove it
-                    const flatSegmentLength = filteredData.length - flatSegmentStart;
-                    if (flatSegmentLength > filteredData.length * 0.1 && flatSegmentStart > 0) {
-                        console.log(`Removing trailing flat segment: ${flatSegmentLength} points with value ${lastValue.toFixed(4)}`);
-                        filteredData.splice(flatSegmentStart + 1); // Keep one point at the start of flat segment
-                    }
-                }
-                
-                finalData = filteredData;
-                
-                console.log(`After removing flat segments: ${finalData.length} points (removed ${chartData.length - finalData.length} total)`);
-                
-                // Check for remaining duplicates
-                const timeSet = new Set();
-                const duplicates = [];
-                finalData.forEach((item, index) => {
-                    if (timeSet.has(item.time)) {
-                        duplicates.push({ index, time: item.time, value: item.value });
-                    }
-                    timeSet.add(item.time);
-                });
-                
-                if (duplicates.length > 0) {
-                    console.warn(`WARNING: Still found ${duplicates.length} duplicate timestamps after deduplication!`, duplicates.slice(0, 5));
-                }
-                
-                if (finalData.length === 0) {
-                    console.error('No valid data points to plot');
-                    return;
-                }
-                
-                // For large datasets, use update method instead of setData
-                // This is more efficient and less error-prone
-                try {
-                    // Clear any existing data first
-                    series.setData([]);
-                    
-                    // Wait a moment for the clear to take effect
-                    await new Promise(resolve => setTimeout(resolve, 50));
-                    
-                    // Set all data at once - the library should handle it
-                    // But we'll do it in one go with validated data
-                    series.setData(finalData);
-                    
-                    console.log(`Successfully set ${finalData.length} data points`);
-                } catch (e) {
-                    console.error('Error setting CSV data to chart:', e);
-                    console.error('Error details:', e.message, e.stack);
-                    
-                    // Try setting in smaller chunks as fallback
-                    console.log('Attempting to set data in smaller chunks...');
-                    const CHUNK_SIZE = 500;
-                    try {
-                        series.setData([]);
-                        for (let i = 0; i < finalData.length; i += CHUNK_SIZE) {
-                            const chunk = finalData.slice(0, i + CHUNK_SIZE);
-                            series.setData(chunk);
-                            await new Promise(resolve => setTimeout(resolve, 20));
-                        }
-                        console.log('Data set successfully in chunks');
-                    } catch (chunkError) {
-                        console.error('Failed to set data even in chunks:', chunkError);
-                    }
-                }
-                
-                console.log(`Successfully plotted ${chartData.length} data points from CSV`);
-                
-                // Only auto-zoom if chart is empty (first load)
-                // Otherwise preserve user's current zoom/pan position
-                const existingData = series.data();
-                if (!existingData || existingData.length === 0) {
-                    setTimeout(() => {
-                        if (chart && chart.timeScale) {
-                            chart.timeScale().fitContent();
-                            console.log('First CSV load - fitContent called');
-                        }
-                    }, 200);
-                } else {
-                    console.log('CSV data loaded - preserving zoom/pan position');
-                }
-                
-                // Update fetch status
-                const fetchStatus = document.getElementById('fetchStatus');
-                if (fetchStatus) {
-                    fetchStatus.textContent = `Loaded ${chartData.length} points from CSV`;
-                    fetchStatus.style.backgroundColor = '#10b981';
-                }
-            } else {
-                console.warn('No valid data points to plot from CSV');
-            }
-        } else {
-            console.log('No CSV data available or empty CSV file');
+        if (!data.success || !data.timestamps || data.timestamps.length === 0) {
+            console.warn('[loadCSVData] No data received or empty timestamps for symbol:', symbol);
+            return;
         }
+        
+        // STRICT VALIDATION: Verify loaded symbol matches requested symbol
+        if (data.symbol && data.symbol !== symbol) {
+            console.error(`[loadCSVData] Symbol mismatch: requested '${symbol}' but got '${data.symbol}' from CSV. Rejecting data.`);
+            return;
+        }
+        
+        console.log(`[loadCSVData] Loaded ${data.data_points} data points from CSV for symbol: ${symbol}`);
+        
+        // Queue update through ChartUpdateManager (handles all validation and updates)
+        await chartUpdateManager.queueUpdate(symbol, data, 'csv');
+        
+        // Update currentSymbol tracking
+        currentSymbol = symbol;
     } catch (error) {
-        console.error('Error loading CSV data:', error);
+        console.error('[loadCSVData] Error loading CSV data:', error);
+        // Don't use fallback data - if CSV load fails, chart should remain empty or show current data
     }
 }
 
 // Event listeners
 document.addEventListener('DOMContentLoaded', () => {
     console.log('DOM loaded, initializing...');
+    
+    // Initialize: Show automatic mode by default
+    toggleMode();
+    
+    // Load symbol settings
+    loadSymbolSettings();
+    
+    // Load logs
+    loadLogs();
+    
+    // Auto-refresh logs every 5 seconds
+    setInterval(loadLogs, 5000);
     
     try {
         // Wait for LightweightCharts library to load and DOM to be ready
@@ -1296,10 +1563,9 @@ document.addEventListener('DOMContentLoaded', () => {
                     if (initChart()) {
                         checkLoginStatus();
                         
-                        // Load CSV data after chart is initialized
-                        setTimeout(() => {
-                            loadCSVData();
-                        }, 300);
+                        // Don't auto-load CSV on page load - only load when explicit symbol is provided
+                        // CSV will be loaded when user starts fetching for a specific symbol
+                        console.log('Chart initialized - CSV will be loaded when symbol is selected');
                     } else {
                         console.error('Chart initialization failed');
                     }
@@ -1321,21 +1587,33 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         }, 5000);
         
-        // Make loginToAPI globally accessible for onclick handler
-        window.loginToAPI = loginToAPI;
+        // Verify loginToAPI is available
+        if (typeof window.loginToAPI === 'function') {
+            console.log('[DOMContentLoaded] ✓ loginToAPI function is available');
+        } else {
+            console.error('[DOMContentLoaded] ✗ loginToAPI function NOT available!');
+        }
         
-        // Attach login button event listener
+        // Attach event listener to login button (SIMPLE - just call the function)
         const loginBtn = document.getElementById('loginBtn');
         if (loginBtn) {
-            loginBtn.addEventListener('click', (e) => {
+            loginBtn.addEventListener('click', function(e) {
                 e.preventDefault();
                 e.stopPropagation();
-                console.log('Login button clicked (event listener)');
-                loginToAPI();
+                console.log('[Login Button] Clicked');
+                
+                if (window.loginToAPI && typeof window.loginToAPI === 'function') {
+                    window.loginToAPI().catch(error => {
+                        console.error('[Login Button] Error:', error);
+                    });
+                } else {
+                    console.error('[Login Button] loginToAPI not available');
+                    alert('Login function not loaded. Please refresh the page.');
+                }
             });
-            console.log('Login button event listener attached');
+            console.log('[DOMContentLoaded] ✓ Login button event listener attached');
         } else {
-            console.error('Login button not found in DOM');
+            console.error('[DOMContentLoaded] ✗ Login button not found');
         }
         
         // Make startFetching globally accessible

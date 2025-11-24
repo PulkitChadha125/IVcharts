@@ -27,7 +27,7 @@
                     <h2>Dashboard</h2>
                 </div>
                 <div class="header-right">
-                    <button id="loginBtn" class="btn-primary" onclick="loginToAPI()">Login to API</button>
+                    <button id="loginBtn" class="btn-primary">Login to API</button>
                     <div class="user-profile">
                         <div class="profile-icon">👤</div>
                     </div>
@@ -50,8 +50,8 @@
                         <div class="input-group">
                             <label for="mode">Selection Mode</label>
                             <select id="mode" onchange="toggleMode()">
-                                <option value="manual" selected>Manual Selection</option>
-                                <option value="automatic">Automatic Selection</option>
+                                <option value="manual">Manual Selection</option>
+                                <option value="automatic" selected>Automatic Selection</option>
                             </select>
                         </div>
                         <div class="input-group">
@@ -102,23 +102,25 @@
                     </div>
                     
                     <!-- Automatic Mode Fields -->
-                    <div id="automaticModeFields" style="display: none;">
+                    <div id="automaticModeFields">
                         <div class="settings-row">
                             <div class="input-group">
                                 <label for="futureSymbol">Future Symbol</label>
-                                <input type="text" id="futureSymbol" placeholder="e.g., NSE:NIFTY25NOVFUT" value="NSE:NIFTY25NOVFUT">
+                                <select id="futureSymbol" onchange="onFutureSymbolChange()">
+                                    <option value="">Loading symbols...</option>
+                                </select>
                             </div>
                             <div class="input-group">
                                 <label for="expiryType">Expiry Type</label>
                                 <select id="expiryType">
-                                    <option value="weekly" selected>Weekly</option>
-                                    <option value="monthly">Monthly</option>
+                                    <option value="weekly">Weekly</option>
+                                    <option value="monthly" selected>Monthly</option>
                                 </select>
                             </div>
                         </div>
                         <div class="settings-row">
                             <div class="input-group">
-                                <label for="autoExpiryDate">Expiry Date</label>
+                                <label for="autoExpiryDate">Option Expiry Date</label>
                                 <input type="date" id="autoExpiryDate">
                             </div>
                             <div class="input-group">
@@ -130,8 +132,8 @@
                             </div>
                             <div class="input-group">
                                 <label for="strikeStep">Strike Step</label>
-                                <input type="number" id="strikeStep" placeholder="Auto (50/100)" step="1" min="1" title="Strike interval (e.g., 50 for NIFTY, 100 for BANKNIFTY). Leave empty for auto-detection.">
-                                <small style="color: #a0c4ff; display: block; margin-top: 4px;">Leave empty for auto (50/100)</small>
+                                <input type="number" id="strikeStep" placeholder="Auto" step="1" min="1" title="Strike interval (e.g., 50 for NIFTY, 100 for BANKNIFTY). Auto-filled from symbol settings.">
+                                <small style="color: #a0c4ff; display: block; margin-top: 4px;">Auto-filled from symbol settings</small>
                             </div>
                         </div>
                         <div class="settings-row">
@@ -149,6 +151,29 @@
                             <button id="startBtn" class="btn-success" onclick="startFetching()">Start Fetching</button>
                             <button id="stopBtn" class="btn-danger" onclick="stopFetching()">Stop Fetching</button>
                         </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Logs Section -->
+            <div class="logs-section" style="margin-bottom: 20px;">
+                <div class="settings-card">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <h3 style="margin: 0;">Application Logs</h3>
+                        <div style="display: flex; gap: 10px; align-items: center;">
+                            <select id="logLevelFilter" onchange="loadLogs()" style="padding: 6px 10px; background: #1e3a5f; border: 1px solid #3a5f8f; border-radius: 4px; color: #a0c4ff; font-size: 13px;">
+                                <option value="">All Levels</option>
+                                <option value="ERROR">Errors Only</option>
+                                <option value="WARNING">Warnings</option>
+                                <option value="INFO">Info</option>
+                                <option value="DEBUG">Debug</option>
+                            </select>
+                            <button onclick="loadLogs()" class="btn-primary" style="padding: 6px 12px; font-size: 13px;">Refresh</button>
+                            <button onclick="clearLogs()" class="btn-danger" style="padding: 6px 12px; font-size: 13px;">Clear Logs</button>
+                        </div>
+                    </div>
+                    <div id="logsContainer" style="background: #0f1e2e; border: 1px solid #3a5f8f; border-radius: 4px; padding: 15px; max-height: 300px; overflow-y: auto; font-family: 'Courier New', monospace; font-size: 12px;">
+                        <div style="color: #a0c4ff; text-align: center; padding: 20px;">Loading logs...</div>
                     </div>
                 </div>
             </div>
@@ -195,6 +220,11 @@
     </div>
 
     <script src="{{ url_for('static', filename='js/tradingview-chart.js') }}"></script>
+    <script>
+        // Ensure loginToAPI is available immediately when script loads
+        // This runs before DOMContentLoaded, so the function is available for any early clicks
+        console.log('Script loaded, checking loginToAPI availability...');
+    </script>
 </body>
 </html>
 

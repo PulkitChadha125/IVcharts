@@ -17,7 +17,7 @@ Where:
 - `S` = Underlying asset price (spot price)
 - `K` = Strike price (extracted from option symbol)
 - `t` = Time to expiration in years
-- `r` = Risk-free interest rate (default: 0.1 or 10%)
+- `r` = Risk-free interest rate (default: 0.07 or 7% = 91-day Indian T-Bill yield)
 - `flag` = 'c' for call options, 'p' for put options
 
 The function uses numerical methods to solve for the implied volatility that makes the Black-Scholes formula match the observed option price.
@@ -102,7 +102,7 @@ Result: Annualized volatility as a percentage.
 
 3. **Automatic Detection**: The application automatically detects if a symbol is an option (ends with CE/PE) and uses the appropriate calculation method.
 
-4. **Risk-Free Rate**: Default is 10% (0.1). This can be adjusted in the code if needed.
+4. **Risk-Free Rate**: Default is 7% (0.07) = 91-day Indian T-Bill yield. This can be adjusted in the code if needed.
 
 5. **Time to Expiry**: Calculated dynamically for each timestamp in the historical data, accounting for the option's expiry date.
 
