@@ -361,15 +361,25 @@ class ChartUpdateManager {
 const chartUpdateManager = new ChartUpdateManager();
 
 // Helper function to convert IST timestamp string to Unix timestamp
-// CSV timestamps are in IST format: "2025-11-13 15:29:00"
+// Timestamps from backend are in IST format: "2025-11-13T15:29:00+05:30" or "2025-11-13 15:29:00"
+// CSV timestamps are timezone-naive strings that represent IST times
 // We need to create a Unix timestamp that represents this IST time correctly
-// The chart library will display it in the browser's timezone, so we need to ensure
-// the Unix timestamp correctly represents the IST time
+// The chart library displays times in the browser's local timezone, so we need to ensure
+// the Unix timestamp represents the correct IST moment in time
 function convertToIST(timestamp) {
     try {
         if (typeof timestamp === 'string') {
+            // Check if timestamp already has timezone info (e.g., "+05:30")
+            if (timestamp.includes('+05:30')) {
+                // Already has IST timezone info, parse directly
+                const istDate = new Date(timestamp);
+                if (!isNaN(istDate.getTime())) {
+                    return Math.floor(istDate.getTime() / 1000);
+                }
+            }
+            
             // Parse timestamp string (format: "2025-11-13 15:29:00" or "2025-11-13T15:29:00")
-            // Remove timezone info if present
+            // Remove any existing timezone info if present
             let cleanTimestamp = timestamp.replace(/[+-]\d{2}:\d{2}$/, '').trim();
             
             // Try to parse the date components
@@ -385,37 +395,74 @@ function convertToIST(timestamp) {
                 const minuteInt = parseInt(minute);
                 const secondInt = parseInt(second || 0);
                 
-                // CSV timestamps are in IST (UTC+5:30)
-                // Parse the timestamp with explicit IST timezone offset (+05:30)
-                // This ensures JavaScript Date correctly interprets it as IST time
-                // Format: "2025-11-13T15:29:00+05:30"
-                const istTimestampString = `${yearInt}-${String(monthInt + 1).padStart(2, '0')}-${String(dayInt).padStart(2, '0')}T${String(hourInt).padStart(2, '0')}:${String(minuteInt).padStart(2, '0')}:${String(secondInt).padStart(2, '0')}+05:30`;
+                // CRITICAL: Timestamps from CSV are in IST (UTC+5:30)
+                // CSV times like "2025-11-13 11:55:00" represent IST time (11:55 AM IST)
+                // We want the chart to display IST times regardless of browser timezone
+                // 
+                // Strategy: Create a Unix timestamp that represents the IST moment correctly,
+                // then adjust it so the chart displays IST time even if browser is in different timezone
                 
+                // Parse as IST time with explicit timezone
+                const istTimestampString = `${yearInt}-${String(monthInt + 1).padStart(2, '0')}-${String(dayInt).padStart(2, '0')}T${String(hourInt).padStart(2, '0')}:${String(minuteInt).padStart(2, '0')}:${String(secondInt).padStart(2, '0')}+05:30`;
                 const istDate = new Date(istTimestampString);
                 
-                if (isNaN(istDate.getTime())) {
-                    // Fallback: Manual calculation
-                    // Create UTC date and subtract IST offset
-                    const utcDate = new Date(Date.UTC(yearInt, monthInt, dayInt, hourInt, minuteInt, secondInt));
-                    const istOffsetMs = 5.5 * 60 * 60 * 1000; // 5 hours 30 minutes
-                    const correctUTCDate = new Date(utcDate.getTime() - istOffsetMs);
+                if (!isNaN(istDate.getTime())) {
+                    // Get the Unix timestamp (this represents the correct IST moment in UTC)
+                    let unixTimestampMs = istDate.getTime();
                     
-                    if (!isNaN(correctUTCDate.getTime())) {
-                        return Math.floor(correctUTCDate.getTime() / 1000);
-                    }
+                    // Get browser timezone offset (minutes behind UTC, positive = behind UTC)
+                    const browserOffsetMinutes = new Date().getTimezoneOffset();
+                    const istOffsetMinutes = -330; // IST is UTC+5:30 = -330 minutes
                     
-                    // Last resort: parse as local timezone
-                    const lastResort = new Date(cleanTimestamp);
-                    if (!isNaN(lastResort.getTime())) {
-                        return Math.floor(lastResort.getTime() / 1000);
-                    }
-                    return null;
+                    // Calculate difference: how many minutes different is browser from IST?
+                    const offsetDiffMinutes = browserOffsetMinutes - istOffsetMinutes;
+                    
+                    // Adjust timestamp: if browser is ahead of IST, we need to add time
+                    // so that when chart displays in browser timezone, it shows IST time
+                    // Example: Browser in UTC (0 offset), IST is +5:30
+                    // We want chart to show 11:55 IST, so we send timestamp for 11:55 UTC
+                    // which will display as 11:55 in UTC browser, but represents 17:25 IST moment
+                    // So we need to subtract the difference to make it display correctly
+                    unixTimestampMs = unixTimestampMs - (offsetDiffMinutes * 60 * 1000);
+                    
+                    return Math.floor(unixTimestampMs / 1000);
                 }
                 
-                return Math.floor(istDate.getTime() / 1000);
+                // Fallback: Create UTC date and manually adjust
+                // IST 11:55:00 = UTC 06:25:00 (subtract 5:30)
+                let utcHour = hourInt;
+                let utcMinute = minuteInt;
+                let utcDay = dayInt;
+                
+                // Subtract 5:30 from IST time to get UTC
+                utcMinute -= 30;
+                if (utcMinute < 0) {
+                    utcMinute += 60;
+                    utcHour -= 1;
+                }
+                utcHour -= 5;
+                if (utcHour < 0) {
+                    utcHour += 24;
+                    utcDay -= 1;
+                }
+                
+                const utcDate = new Date(Date.UTC(yearInt, monthInt, utcDay, utcHour, utcMinute, secondInt));
+                let unixTimestampMs = utcDate.getTime();
+                
+                // Adjust for browser timezone to display IST
+                const browserOffsetMinutes_fallback = new Date().getTimezoneOffset();
+                const istOffsetMinutes_fallback = -330;
+                const offsetDiffMinutes_fallback = browserOffsetMinutes_fallback - istOffsetMinutes_fallback;
+                unixTimestampMs = unixTimestampMs - (offsetDiffMinutes_fallback * 60 * 1000);
+                
+                if (!isNaN(unixTimestampMs)) {
+                    return Math.floor(unixTimestampMs / 1000);
+                }
+                
+                return null;
             } else {
                 // Try standard Date parsing as fallback
-                const date = new Date(cleanTimestamp);
+                const date = new Date(timestamp);
                 if (!isNaN(date.getTime())) {
                     return Math.floor(date.getTime() / 1000);
                 }
@@ -844,6 +891,50 @@ async function fetchIVData(symbol) {
 }
 
 // Check login status
+// Check symbol download status after login
+let symbolCheckInterval = null;
+function checkSymbolDownloadStatus() {
+    let checkCount = 0;
+    const maxChecks = 30; // Check for up to 30 seconds (30 checks * 1 second)
+    
+    symbolCheckInterval = setInterval(async () => {
+        checkCount++;
+        
+        try {
+            const response = await fetch('/api/list_symbol_files');
+            const data = await response.json();
+            
+            if (data.success && data.count > 0) {
+                // Symbols have been downloaded
+                clearInterval(symbolCheckInterval);
+                symbolCheckInterval = null;
+                
+                const statusText = document.getElementById('statusText');
+                if (statusText) {
+                    statusText.textContent = `Logged in - ${data.total_symbols.toLocaleString()} symbols available`;
+                }
+                
+                showNotification(`Symbol download complete! ${data.total_symbols.toLocaleString()} symbols available from ${data.count} exchange(s)`, 'success');
+            } else if (checkCount >= maxChecks) {
+                // Timeout - stop checking
+                clearInterval(symbolCheckInterval);
+                symbolCheckInterval = null;
+                
+                const statusText = document.getElementById('statusText');
+                if (statusText) {
+                    statusText.textContent = 'Logged in - Symbol download in progress...';
+                }
+            }
+        } catch (error) {
+            console.error('Error checking symbol download status:', error);
+            if (checkCount >= maxChecks) {
+                clearInterval(symbolCheckInterval);
+                symbolCheckInterval = null;
+            }
+        }
+    }, 1000); // Check every second
+}
+
 async function checkLoginStatus() {
     try {
         const response = await fetch('/api/check_login');
@@ -934,7 +1025,23 @@ window.loginToAPI = async function loginToAPI() {
             document.getElementById('statusText').textContent = 'Logged in successfully';
             document.getElementById('settingsSection').style.display = 'block';
             btn.textContent = 'Logged In';
-            showNotification('Login successful!', 'success');
+            
+            // Show appropriate notification based on symbol download status
+            if (data.downloading_symbols) {
+                showNotification('Login successful! Downloading all symbols in background...', 'info');
+                // Update status text to show symbol download
+                setTimeout(() => {
+                    const statusText = document.getElementById('statusText');
+                    if (statusText) {
+                        statusText.textContent = 'Logged in - Downloading symbols...';
+                    }
+                }, 500);
+                
+                // Check symbol download status periodically
+                checkSymbolDownloadStatus();
+            } else {
+                showNotification('Login successful!', 'success');
+            }
         } else {
             btn.disabled = false;
             btn.textContent = 'Login to API';

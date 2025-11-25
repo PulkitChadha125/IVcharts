@@ -239,6 +239,7 @@ def fetchOHLC_Scanner(symbol):
         "cont_flag": "1"
     }
     response = fyers.history(data=data)
+
     cl = ['date', 'open', 'high', 'low', 'close', 'volume']
     df = pd.DataFrame(response['candles'], columns=cl)
     df['date']=df['date'].apply(pd.Timestamp,unit='s',tzinfo=pytz.timezone('Asia/Kolkata'))
@@ -358,7 +359,6 @@ def fetchOHLC_Weekly(symbol):
 #     return df_weekly  # Return last 20 weeks
 
 def fetchOHLC(symbol,tf):
-    print("symbol: ",symbol)
     dat =str(datetime.now().date())
     dat1 = str((datetime.now() - timedelta(17)).date())
     data = {
@@ -369,12 +369,59 @@ def fetchOHLC(symbol,tf):
         "range_to": dat,
         "cont_flag": "1"
     }
-    response = fyers.history(data=data)
-    # print("response: ",response)
-    cl = ['date', 'open', 'high', 'low', 'close', 'volume']
-    df = pd.DataFrame(response['candles'], columns=cl)
-    df['date']=df['date'].apply(pd.Timestamp,unit='s',tzinfo=pytz.timezone('Asia/Kolkata'))
-    return df
+    
+    try:
+        response = fyers.history(data=data)
+        
+        # Check response structure (minimal logging)
+        if isinstance(response, dict):
+            if 's' in response:
+                status = response['s']
+                if status != 'ok':
+                    print(f"⚠️ API Status: {status}")
+            if 'candles' in response:
+                candle_count = len(response['candles']) if isinstance(response['candles'], list) else 0
+                print(f"✓ Fetched {candle_count} candles for {symbol}")
+            else:
+                print(f"⚠️ WARNING: 'candles' key not found in response for {symbol}")
+                print(f"Response keys: {list(response.keys())}")
+        else:
+            print(f"⚠️ WARNING: Response is not a dict, type: {type(response)}")
+        
+        # Check if response has error
+        if isinstance(response, dict) and response.get('s') != 'ok':
+            error_msg = response.get('message', 'Unknown error')
+            print(f"❌ API Error: {error_msg}")
+            print(f"Response: {response}")
+            return None
+        
+        # Check if candles exist
+        if 'candles' not in response:
+            print("❌ ERROR: 'candles' key missing in response")
+            return None
+        
+        if not isinstance(response['candles'], list):
+            print(f"❌ ERROR: 'candles' is not a list, type: {type(response['candles'])}")
+            return None
+        
+        if len(response['candles']) == 0:
+            print("⚠️ WARNING: Empty candles list returned")
+            return pd.DataFrame()  # Return empty DataFrame
+        
+        cl = ['date', 'open', 'high', 'low', 'close', 'volume']
+        df = pd.DataFrame(response['candles'], columns=cl)
+        df['date']=df['date'].apply(pd.Timestamp,unit='s',tzinfo=pytz.timezone('Asia/Kolkata'))
+        
+        return df
+        
+    except Exception as e:
+        print(f"\n❌ EXCEPTION in fetchOHLC:")
+        print(f"Error type: {type(e).__name__}")
+        print(f"Error message: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        print("="*80 + "\n")
+        raise
 
 
 def fetchOHLC_get_selected_price(symbol, date):
@@ -488,6 +535,413 @@ def fyres_quote(symbol):
 
     response = fyers.quotes(data=data)
     return response
+
+def download_fyers_symbols(exchange=None, save_path="fyers_symbols"):
+    """
+    Download all tradable symbols from Fyers Symbol Master JSON files
+    
+    Parameters:
+    - exchange: Optional exchange filter. Can be:
+                - None: downloads all exchanges
+                - String: single exchange (e.g., 'NSE_CM', 'NSE_FO', 'NSE_CD', 'NSE_COM', 
+                  'BSE_CM', 'BSE_FO', 'MCX_COM')
+                - List: multiple exchanges (e.g., ['MCX_COM', 'NSE_FO'])
+                - Base exchange: 'NSE', 'MCX', 'BSE' (downloads all segments for that exchange)
+    - save_path: Directory path to save the CSV files (default: "fyers_symbols")
+    
+    Returns:
+    - Dictionary with exchange names as keys and file paths as values
+    """
+    import os
+    import csv
+    import json
+    
+    # Fyers Symbol Master JSON file URLs
+    symbol_master_urls = {
+        'NSE_CD': {
+            'url': 'https://public.fyers.in/sym_details/NSE_CD_sym_master.json',
+            'name': 'NSE Currency Derivatives',
+            'exchange': 'NSE'
+        },
+        'NSE_FO': {
+            'url': 'https://public.fyers.in/sym_details/NSE_FO_sym_master.json',
+            'name': 'NSE Equity Derivatives',
+            'exchange': 'NSE'
+        },
+        'NSE_COM': {
+            'url': 'https://public.fyers.in/sym_details/NSE_COM_sym_master.json',
+            'name': 'NSE Commodity',
+            'exchange': 'NSE'
+        },
+        'NSE_CM': {
+            'url': 'https://public.fyers.in/sym_details/NSE_CM_sym_master.json',
+            'name': 'NSE Capital Market',
+            'exchange': 'NSE'
+        },
+        'BSE_CM': {
+            'url': 'https://public.fyers.in/sym_details/BSE_CM_sym_master.json',
+            'name': 'BSE Capital Market',
+            'exchange': 'BSE'
+        },
+        'BSE_FO': {
+            'url': 'https://public.fyers.in/sym_details/BSE_FO_sym_master.json',
+            'name': 'BSE Equity Derivatives',
+            'exchange': 'BSE'
+        },
+        'MCX_COM': {
+            'url': 'https://public.fyers.in/sym_details/MCX_COM_sym_master.json',
+            'name': 'MCX Commodity',
+            'exchange': 'MCX'
+        }
+    }
+    
+    # Create save directory if it doesn't exist
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+        print(f"Created directory: {save_path}")
+    
+    downloaded_files = {}
+    
+    # Filter exchanges if specified
+    if exchange:
+        # Handle list of exchanges
+        if isinstance(exchange, list):
+            exchanges_to_download = [e for e in exchange if e in symbol_master_urls]
+        # Support both old format (NSE, MCX) and new format (NSE_CM, NSE_FO, etc.)
+        elif exchange in symbol_master_urls:
+            exchanges_to_download = [exchange]
+        elif exchange == 'NSE':
+            # Download all NSE segments
+            exchanges_to_download = [k for k in symbol_master_urls.keys() if k.startswith('NSE_')]
+        elif exchange == 'MCX':
+            exchanges_to_download = [k for k in symbol_master_urls.keys() if k.startswith('MCX_')]
+        elif exchange == 'BSE':
+            exchanges_to_download = [k for k in symbol_master_urls.keys() if k.startswith('BSE_')]
+        else:
+            exchanges_to_download = [exchange] if exchange in symbol_master_urls else []
+    else:
+        exchanges_to_download = list(symbol_master_urls.keys())
+    
+    for exch_key in exchanges_to_download:
+        if exch_key not in symbol_master_urls:
+            print(f"Warning: Exchange '{exch_key}' not found in available exchanges")
+            continue
+        
+        exch_info = symbol_master_urls[exch_key]
+        url = exch_info['url']
+        file_path = os.path.join(save_path, f"{exch_key}_symbols.csv")
+        
+        try:
+            print(f"Downloading {exch_info['name']} symbols from {url}...")
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            
+            # Parse JSON response
+            json_data = response.json()
+            
+            # Convert JSON to CSV
+            if isinstance(json_data, dict):
+                # If JSON is a dict, check if it has a list of symbols
+                if 'symbols' in json_data:
+                    symbols_list = json_data['symbols']
+                elif 'data' in json_data:
+                    symbols_list = json_data['data']
+                else:
+                    # Try to find the first list value
+                    symbols_list = None
+                    for key, value in json_data.items():
+                        if isinstance(value, list) and len(value) > 0:
+                            symbols_list = value
+                            break
+                    
+                    if symbols_list is None:
+                        # If no list found, treat the dict itself as a single symbol
+                        symbols_list = [json_data]
+            elif isinstance(json_data, list):
+                symbols_list = json_data
+            else:
+                raise ValueError(f"Unexpected JSON format: {type(json_data)}")
+            
+            if not symbols_list or len(symbols_list) == 0:
+                print(f"  ⚠ No symbols found in {exch_key}")
+                downloaded_files[exch_key] = {
+                    'file_path': None,
+                    'symbol_count': 0,
+                    'url': url,
+                    'error': 'No symbols found in JSON'
+                }
+                continue
+            
+            # Get all unique keys from all symbols to create CSV columns
+            all_keys = set()
+            for symbol in symbols_list:
+                if isinstance(symbol, dict):
+                    all_keys.update(symbol.keys())
+            
+            # Ensure common columns are first
+            priority_keys = ['Fytoken', 'fytoken', 'Symbol', 'symbol', 'Exch', 'exch', 
+                           'InstrumentType', 'instrument_type', 'LotSize', 'lot_size',
+                           'TickSize', 'tick_size', 'ISIN', 'isin']
+            ordered_keys = []
+            
+            # Add priority keys first
+            for key in priority_keys:
+                if key in all_keys:
+                    ordered_keys.append(key)
+                    all_keys.remove(key)
+            
+            # Add remaining keys alphabetically
+            ordered_keys.extend(sorted(all_keys))
+            
+            # Add Exchange column
+            if 'Exchange' not in ordered_keys:
+                ordered_keys.insert(0, 'Exchange')
+            
+            # Write to CSV
+            with open(file_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=ordered_keys, extrasaction='ignore')
+                writer.writeheader()
+                
+                for symbol in symbols_list:
+                    if isinstance(symbol, dict):
+                        # Add Exchange column
+                        symbol['Exchange'] = exch_info['exchange']
+                        writer.writerow(symbol)
+            
+            symbol_count = len(symbols_list)
+            
+            downloaded_files[exch_key] = {
+                'file_path': file_path,
+                'symbol_count': symbol_count,
+                'url': url,
+                'name': exch_info['name']
+            }
+            
+            print(f"✓ Downloaded {exch_info['name']}: {symbol_count:,} symbols saved to {file_path}")
+            
+        except requests.exceptions.RequestException as e:
+            print(f"✗ Error downloading {exch_info['name']} symbols: {e}")
+            downloaded_files[exch_key] = {
+                'file_path': None,
+                'error': str(e),
+                'url': url,
+                'name': exch_info['name']
+            }
+        except json.JSONDecodeError as e:
+            print(f"✗ Error parsing JSON for {exch_info['name']}: {e}")
+            downloaded_files[exch_key] = {
+                'file_path': None,
+                'error': f"JSON parse error: {str(e)}",
+                'url': url,
+                'name': exch_info['name']
+            }
+        except Exception as e:
+            print(f"✗ Unexpected error downloading {exch_info['name']} symbols: {e}")
+            import traceback
+            traceback.print_exc()
+            downloaded_files[exch_key] = {
+                'file_path': None,
+                'error': str(e),
+                'url': url,
+                'name': exch_info['name']
+            }
+    
+    # Create master CSV file after downloading (if at least one file was downloaded)
+    successful_downloads = [f for f in downloaded_files.values() if f.get('file_path')]
+    if successful_downloads:
+        print("\nCreating master symbols CSV file...")
+        master_path = create_master_symbols_csv(save_path, "fyers_master_symbols.csv")
+        if master_path:
+            downloaded_files['_master'] = {
+                'file_path': master_path,
+                'symbol_count': sum(f.get('symbol_count', 0) for f in successful_downloads),
+                'type': 'master_consolidated'
+            }
+    
+    return downloaded_files
+
+def create_master_symbols_csv(symbols_dir="fyers_symbols", master_file="fyers_master_symbols.csv"):
+    """
+    Create a consolidated master CSV file from all downloaded symbol files
+    
+    Parameters:
+    - symbols_dir: Directory where individual exchange symbol CSV files are stored
+    - master_file: Output filename for the master CSV file
+    
+    Returns:
+    - Path to the created master CSV file, or None if failed
+    """
+    import os
+    import csv
+    from datetime import datetime
+    
+    if not os.path.exists(symbols_dir):
+        print(f"Symbols directory '{symbols_dir}' does not exist")
+        return None
+    
+    # Find all symbol CSV files (exclude master file itself)
+    symbol_files = [f for f in os.listdir(symbols_dir) 
+                    if f.endswith('_symbols.csv') and f != master_file]
+    
+    if not symbol_files:
+        print(f"No symbol files found in '{symbols_dir}'")
+        return None
+    
+    master_path = os.path.join(symbols_dir, master_file)
+    all_symbols = []
+    exchange_counts = {}
+    
+    print(f"Creating master symbols file from {len(symbol_files)} exchange(s)...")
+    
+    # Read all symbol files and combine them
+    for symbol_file in symbol_files:
+        exchange_segment = symbol_file.replace('_symbols.csv', '')
+        file_path = os.path.join(symbols_dir, symbol_file)
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+                
+                # Add exchange segment column to each row if not present
+                for row in rows:
+                    # Exchange column should already exist from download, but add ExchangeSegment
+                    if 'ExchangeSegment' not in row and 'exchange_segment' not in row:
+                        row['ExchangeSegment'] = exchange_segment
+                    # Ensure Exchange column exists (base exchange like NSE, MCX, BSE)
+                    if 'Exchange' not in row and 'exchange' not in row:
+                        # Extract base exchange from segment (NSE_CM -> NSE)
+                        base_exchange = exchange_segment.split('_')[0] if '_' in exchange_segment else exchange_segment
+                        row['Exchange'] = base_exchange
+                    all_symbols.append(row)
+                
+                exchange_counts[exchange_segment] = len(rows)
+                print(f"  ✓ Added {len(rows)} symbols from {exchange_segment}")
+                
+        except Exception as e:
+            print(f"  ✗ Error reading {symbol_file}: {e}")
+            continue
+    
+    if not all_symbols:
+        print("No symbols found to consolidate")
+        return None
+    
+    # Get all unique column names from all rows
+    all_columns = set()
+    for row in all_symbols:
+        all_columns.update(row.keys())
+    
+    # Ensure Exchange and ExchangeSegment are first, then Symbol, then others alphabetically
+    priority_columns = ['Exchange', 'ExchangeSegment', 'Symbol', 'symbol', 'Fytoken', 'fytoken']
+    ordered_columns = []
+    
+    # Add priority columns first
+    for col in priority_columns:
+        if col in all_columns:
+            ordered_columns.append(col)
+            all_columns.remove(col)
+    
+    # Add remaining columns alphabetically
+    ordered_columns.extend(sorted(all_columns))
+    
+    # Write master CSV file
+    try:
+        with open(master_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=ordered_columns, extrasaction='ignore')
+            writer.writeheader()
+            writer.writerows(all_symbols)
+        
+        total_symbols = len(all_symbols)
+        print(f"✓ Master symbols file created: {master_path}")
+        print(f"  Total symbols: {total_symbols:,}")
+        print(f"  Exchanges: {', '.join(exchange_counts.keys())}")
+        print(f"  Breakdown: {', '.join([f'{exch}: {count:,}' for exch, count in exchange_counts.items()])}")
+        
+        return master_path
+        
+    except Exception as e:
+        print(f"✗ Error writing master CSV file: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def search_symbols(query, exchange=None, symbols_dir="fyers_symbols", use_master=True):
+    """
+    Search for symbols in downloaded Symbol Master files
+    
+    Parameters:
+    - query: Search query (symbol name or part of it)
+    - exchange: Optional exchange filter (e.g., 'NSE', 'MCX')
+    - symbols_dir: Directory where symbol CSV files are stored
+    - use_master: If True, use master file if available (faster). If False, search individual files.
+    
+    Returns:
+    - List of matching symbols with their details
+    """
+    import os
+    import csv
+    import re
+    
+    results = []
+    query_lower = query.lower()
+    
+    # Try to use master file first if available and use_master is True
+    master_file = os.path.join(symbols_dir, 'fyers_master_symbols.csv')
+    if use_master and os.path.exists(master_file) and not exchange:
+        # Use master file for faster search (all exchanges)
+        try:
+            with open(master_file, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    # Search in symbol name (case-insensitive)
+                    symbol = row.get('Symbol', row.get('symbol', ''))
+                    if query_lower in symbol.lower():
+                        results.append(row)
+            return results
+        except Exception as e:
+            print(f"Error reading master file, falling back to individual files: {e}")
+    
+    # Fallback: search individual exchange files
+    if exchange:
+        # Support both old format (NSE, MCX) and new format (NSE_CM, NSE_FO, etc.)
+        if exchange in ['NSE', 'MCX', 'BSE']:
+            # Search all files for that exchange
+            csv_files = [os.path.join(symbols_dir, f) for f in os.listdir(symbols_dir) 
+                        if f.endswith('_symbols.csv') and f.startswith(f"{exchange}_") 
+                        and f != 'fyers_master_symbols.csv'] if os.path.exists(symbols_dir) else []
+        else:
+            # Specific exchange segment (e.g., NSE_CM, NSE_FO)
+            csv_files = [os.path.join(symbols_dir, f"{exchange}_symbols.csv")]
+    else:
+        csv_files = [os.path.join(symbols_dir, f) for f in os.listdir(symbols_dir) 
+                     if f.endswith('_symbols.csv') and f != 'fyers_master_symbols.csv'] if os.path.exists(symbols_dir) else []
+    
+    for csv_file in csv_files:
+        if not os.path.exists(csv_file):
+            continue
+        
+        exchange_name = os.path.basename(csv_file).replace('_symbols.csv', '')
+        
+        try:
+            with open(csv_file, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    # Search in symbol name (case-insensitive)
+                    symbol = row.get('Symbol', row.get('symbol', ''))
+                    if query_lower in symbol.lower():
+                        # Add exchange segment name if not already present
+                        if 'ExchangeSegment' not in row and 'exchange_segment' not in row:
+                            row['ExchangeSegment'] = exchange_name
+                        # Ensure Exchange column exists (should already be there from download)
+                        if 'Exchange' not in row and 'exchange' not in row:
+                            # Extract base exchange from segment (NSE_CM -> NSE)
+                            base_exchange = exchange_name.split('_')[0] if '_' in exchange_name else exchange_name
+                            row['Exchange'] = base_exchange
+                        results.append(row)
+        except Exception as e:
+            print(f"Error reading {csv_file}: {e}")
+    
+    return results
 
 
 

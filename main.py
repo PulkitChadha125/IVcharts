@@ -760,6 +760,7 @@ def calculate_iv_pyvollib(option_price, underlying_price, strike, time_to_expiry
     if not PY_VOLLIB_AVAILABLE:
         return None
     
+    # Validate inputs
     if option_price is None or underlying_price is None or strike is None:
         return None
     
@@ -769,7 +770,34 @@ def calculate_iv_pyvollib(option_price, underlying_price, strike, time_to_expiry
     if time_to_expiry <= 0:
         return None
     
+    # Additional validation to prevent invalid calculations
+    # Check for reasonable values
+    if time_to_expiry > 2.0:  # More than 2 years seems wrong
+        return None
+    
+    if time_to_expiry < 0.0001:  # Less than ~1 hour seems wrong
+        return None
+    
+    # Check if option price is reasonable (should not be more than underlying price for calls)
+    if option_type == 'c' and option_price > underlying_price * 1.5:
+        # Option price too high relative to underlying - likely data error
+        return None
+    
+    # Check if option price is too low (less than 0.1% of strike) - likely data error
+    if option_price < strike * 0.001:
+        return None
+    
     try:
+        # Calculate intrinsic value to validate
+        if option_type == 'c':
+            intrinsic_value = max(0, underlying_price - strike)
+        else:  # put
+            intrinsic_value = max(0, strike - underlying_price)
+        
+        # If option price is significantly below intrinsic value, it's invalid
+        if option_price < intrinsic_value * 0.5:
+            return None
+        
         # py_vollib.black.implied_volatility expects:
         # implied_volatility(price, F, K, r, t, flag)
         # Where: price = option price, F = futures price, K = strike, r = risk-free rate, t = time to expiry, flag = 'c' or 'p'
@@ -783,11 +811,18 @@ def calculate_iv_pyvollib(option_price, underlying_price, strike, time_to_expiry
             option_type               # flag = 'c' or 'p'
         )
         
-        # Debug logging for IV calculation
-        if iv and (iv > 0.5 or iv < 0.01):  # Log if IV seems unusual
-            print(f"  IV Calculation Debug: option_price={option_price:.2f}, future_price={underlying_price:.2f}, "
-                  f"strike={strike:.2f}, time_to_expiry={time_to_expiry:.4f}, risk_free_rate={risk_free_rate:.4f}, "
-                  f"IV={iv:.4f} ({iv*100:.2f}%)")
+        # Validate IV result - filter out unreasonable values
+        if iv is None:
+            return None
+        
+        # IV should be between 0.01% (0.0001) and 200% (2.0) - anything outside is likely wrong
+        if iv < 0.0001 or iv > 2.0:
+            return None
+        
+        # Additional check: if IV is unusually high (>100%), it's likely a calculation error
+        # This can happen with bad data (wrong prices, wrong time_to_expiry, etc.)
+        if iv > 1.0:  # More than 100% IV is very unusual
+            return None
         
         return iv
     except Exception as e:
@@ -808,20 +843,28 @@ def safe_fetch_ohlc(symbol, timeframe):
     """
     try:
         if FyresIntegration.fyers is None:
+            print(f"❌ ERROR: Fyers not initialized. Cannot fetch data for {symbol}")
             return None
         
         # Call the original fetchOHLC function
         df = fetchOHLC(symbol, timeframe)
         return df
+        
     except KeyError as e:
         # Handle case where API response doesn't have 'candles' key
         error_msg = f"API response error for {symbol}: Missing 'candles' key in response"
-        print(f"{error_msg}\nFull error: {e}")
+        print(f"❌ {error_msg}\nFull error: {e}")
+        print(f"Error type: {type(e).__name__}")
+        import traceback
+        traceback.print_exc()
         add_log('ERROR', error_msg, {'symbol': symbol, 'error': str(e), 'error_type': 'KeyError'})
         return None
     except Exception as e:
         error_msg = f"Error fetching OHLC data for {symbol}"
-        print(f"{error_msg}: {e}")
+        print(f"❌ {error_msg}: {e}")
+        print(f"Error type: {type(e).__name__}")
+        import traceback
+        traceback.print_exc()
         add_log('ERROR', error_msg, {'symbol': symbol, 'error': str(e), 'error_type': type(e).__name__})
         return None
 
@@ -915,8 +958,7 @@ def calculate_iv(df, window=20, timeframe='1D', symbol=None, risk_free_rate=0.06
     
     if option_info and PY_VOLLIB_AVAILABLE and option_info.get('strike') and option_info.get('expiry_date'):
         # Calculate IV using py_vollib Black model for options (options on futures)
-        print(f"Calculating IV using py_vollib Black model for option: {symbol}")
-        print(f"  Strike: {option_info['strike']}, Type: {option_info['option_type']}, Expiry: {option_info['expiry_date']}")
+        print(f"Calculating IV for {symbol}...")
         
         underlying_symbol = option_info['underlying']
         expiry_date = option_info['expiry_date']  # Option expiry (used for option symbol and time_to_expiry calculation)
@@ -929,25 +971,18 @@ def calculate_iv(df, window=20, timeframe='1D', symbol=None, risk_free_rate=0.06
         # Otherwise, reconstruct from underlying and option expiry (may be wrong if option expiry != future expiry)
         if manual_future_symbol:
             future_symbol = manual_future_symbol
-            print(f"  Using provided future symbol: {future_symbol} (from SymbolSetting.csv)")
         else:
             # Fallback: reconstruct future symbol from underlying and option expiry
             # NOTE: This may be incorrect if option expiry != future expiry
             future_symbol = get_future_symbol(underlying_symbol, expiry_date)
-            print(f"  WARNING: Reconstructing future symbol from option expiry - may be incorrect if option expiry != future expiry")
-            print(f"  Reconstructed future symbol: {future_symbol}")
         
         if future_symbol:
-            print(f"  Using future symbol: {future_symbol}")
-            
             # Fetch historical data for future symbol
-            print(f"  Fetching historical data for future: {future_symbol}")
             df_future = safe_fetch_ohlc(future_symbol, timeframe)
             
             if df_future is None or len(df_future) == 0:
                 print(f"  Could not fetch historical data for {future_symbol}, falling back to historical volatility")
             else:
-                print(f"  Fetched {len(df_future)} rows of future data")
                 
                 # Prepare option dataframe - keep only date and close
                 df_option = df[['date', 'close']].copy()
@@ -964,14 +999,39 @@ def calculate_iv(df, window=20, timeframe='1D', symbol=None, risk_free_rate=0.06
                 if len(df_merged) == 0:
                     print(f"  No matching dates between option and future data, falling back to historical volatility")
                 else:
-                    print(f"  Merged {len(df_merged)} rows of data")
-                    
                     # Calculate IV for each row using historical future prices
                     iv_values = []
                     
                     for idx, row in df_merged.iterrows():
                         option_price = row['close']
                         future_price = row['fclose']
+                        
+                        # Validate prices are reasonable
+                        if pd.isna(option_price) or pd.isna(future_price):
+                            iv_values.append(np.nan)
+                            continue
+                        
+                        if option_price <= 0 or future_price <= 0:
+                            iv_values.append(np.nan)
+                            continue
+                        
+                        # Additional validation: check if prices are reasonable
+                        # Option price should not be more than 50% of strike (for calls) or underlying (for puts)
+                        # This filters out obvious data errors
+                        strike_price = option_info['strike']
+                        if option_info['option_type'] == 'c':
+                            if option_price > strike_price * 0.5 or option_price > future_price * 0.5:
+                                iv_values.append(np.nan)
+                                continue
+                        else:  # put
+                            if option_price > strike_price * 0.5:
+                                iv_values.append(np.nan)
+                                continue
+                        
+                        # Future price should be reasonable relative to strike (within 50% to 200%)
+                        if future_price < strike_price * 0.5 or future_price > strike_price * 2.0:
+                            iv_values.append(np.nan)
+                            continue
                         
                         if option_price > 0 and future_price > 0:
                             # Calculate time to expiry for this timestamp
@@ -1032,6 +1092,33 @@ def calculate_iv(df, window=20, timeframe='1D', symbol=None, risk_free_rate=0.06
                     # Add IV column
                     df_merged['iv'] = iv_values
                     
+                    # Filter out outliers (IV values that are too different from neighbors)
+                    # This prevents glitches from bad data
+                    iv_series = pd.Series(iv_values)
+                    
+                    # Calculate rolling median to detect outliers
+                    window_size = min(5, max(3, len(iv_series) // 10 + 1))  # Use 5 or 10% of data, whichever is smaller, but at least 3
+                    if window_size >= 3 and len(iv_series) > window_size:
+                        rolling_median = iv_series.rolling(window=window_size, center=True, min_periods=1).median()
+                        rolling_std = iv_series.rolling(window=window_size, center=True, min_periods=1).std()
+                        
+                        # Replace outliers (values more than 3 standard deviations from rolling median)
+                        # Only if the value is significantly different (more than 20% difference)
+                        for i in range(len(iv_series)):
+                            if pd.notna(iv_series.iloc[i]) and pd.notna(rolling_median.iloc[i]):
+                                median_val = rolling_median.iloc[i]
+                                std_val = rolling_std.iloc[i] if pd.notna(rolling_std.iloc[i]) else median_val * 0.1
+                                
+                                # Check if value is an outlier (more than 3 std devs OR more than 20% different)
+                                if abs(iv_series.iloc[i] - median_val) > max(3 * std_val, median_val * 0.2):
+                                    # Replace with median of neighbors
+                                    neighbor_indices = [j for j in range(max(0, i-2), min(len(iv_series), i+3)) if j != i and pd.notna(iv_series.iloc[j])]
+                                    if neighbor_indices:
+                                        neighbor_median = iv_series.iloc[neighbor_indices].median()
+                                        iv_series.iloc[i] = neighbor_median
+                    
+                    df_merged['iv'] = iv_series.values
+                    
                     # Fill NaN values with forward fill, then backward fill
                     df_merged['iv'] = df_merged['iv'].ffill().bfill().fillna(0)
                     
@@ -1051,23 +1138,19 @@ def calculate_iv(df, window=20, timeframe='1D', symbol=None, risk_free_rate=0.06
                     # Ensure date is in the right format
                     df_merged['date'] = pd.to_datetime(df_merged['date'])
                     
-                    # Debug: Print columns before returning
-                    print(f"  DataFrame columns before return: {list(df_merged.columns)}")
-                    print(f"  DataFrame shape: {df_merged.shape}")
-                    
                     # Get valid IVs for logging
                     valid_ivs = [iv for iv in iv_values if iv is not None and not (isinstance(iv, float) and (np.isnan(iv) or np.isinf(iv)))]
                     if len(valid_ivs) > 0:
-                        print(f"Calculated IV using py_vollib Black model with historical future prices (range: {min(valid_ivs):.2f}% - {max(valid_ivs):.2f}%)")
+                        print(f"✓ Calculated IV: {len(valid_ivs)} values (range: {min(valid_ivs):.2f}% - {max(valid_ivs):.2f}%)")
                     
                     return df_merged
         else:
-            print(f"Could not construct future symbol for {underlying_symbol}, falling back to historical volatility")
+            print(f"  Could not construct future symbol for {underlying_symbol}, falling back to historical volatility")
         
-        print("Failed to calculate IV with py_vollib Black model, falling back to historical volatility")
+        print(f"  Failed to calculate IV with py_vollib Black model, falling back to historical volatility")
     
     # Fallback to Historical Volatility calculation
-    print("Using Historical Volatility calculation (rolling standard deviation)")
+    print(f"  Using Historical Volatility calculation (fallback)")
     
     # Calculate log returns
     df['returns'] = np.log(df['close'] / df['close'].shift(1))
@@ -1294,8 +1377,15 @@ def fetch_data_loop_automatic(future_symbol, expiry_date, expiry_type, option_ty
             
             if df_with_iv is not None and 'iv' in df_with_iv.columns:
                 # Filter out zero IV values for charting (but keep in CSV)
+                # Ensure dates are in IST timezone before formatting
+                if df_with_iv['date'].dt.tz is None:
+                    df_with_iv['date'] = df_with_iv['date'].dt.tz_localize('Asia/Kolkata')
+                else:
+                    df_with_iv['date'] = df_with_iv['date'].dt.tz_convert('Asia/Kolkata')
+                
                 iv_values_for_chart = df_with_iv['iv'].fillna(0).tolist()
-                timestamps_for_chart = df_with_iv['date'].astype(str).tolist()
+                # Format timestamps with IST timezone info (+05:30)
+                timestamps_for_chart = df_with_iv['date'].dt.strftime('%Y-%m-%dT%H:%M:%S+05:30').tolist()
                 
                 # Store IV data with timestamps
                 iv_data_store[symbol] = {
@@ -1387,9 +1477,16 @@ def fetch_data_loop(symbol, timeframe, manual_strike=None, manual_expiry=None, m
                     )
                     
                     if df_with_iv is not None and 'iv' in df_with_iv.columns:
+                        # Ensure dates are in IST timezone before formatting
+                        if df_with_iv['date'].dt.tz is None:
+                            df_with_iv['date'] = df_with_iv['date'].dt.tz_localize('Asia/Kolkata')
+                        else:
+                            df_with_iv['date'] = df_with_iv['date'].dt.tz_convert('Asia/Kolkata')
+                        
                         # Filter out zero IV values for charting (but keep in CSV)
                         iv_values_for_chart = df_with_iv['iv'].fillna(0).tolist()
-                        timestamps_for_chart = df_with_iv['date'].astype(str).tolist()
+                        # Format timestamps with IST timezone info (+05:30)
+                        timestamps_for_chart = df_with_iv['date'].dt.strftime('%Y-%m-%dT%H:%M:%S+05:30').tolist()
                         
                         # Store IV data with timestamps
                         iv_data_store[symbol] = {
@@ -1484,7 +1581,39 @@ def login():
                 profile = FyresIntegration.fyers.get_profile()
                 print("Login successful, profile:", profile)
                 session['logged_in'] = True
-                return jsonify({"success": True, "message": "Login successful"})
+                
+                # Automatically download symbols in background after successful login
+                def download_symbols_background():
+                    try:
+                        print("Starting automatic symbol download after login...")
+                        from FyresIntegration import download_fyers_symbols
+                        # Download only MCX_COM and NSE_FO as requested
+                        downloaded_files = download_fyers_symbols(exchange=['MCX_COM', 'NSE_FO'], save_path="fyers_symbols")
+                        total_symbols = sum(f.get('symbol_count', 0) for f in downloaded_files.values() if f.get('file_path'))
+                        exchange_names = [f.get('name', k) for k, f in downloaded_files.items() if f.get('file_path')]
+                        print(f"✓ Symbol download completed: {total_symbols:,} symbols downloaded from {len([f for f in downloaded_files.values() if f.get('file_path')])} exchange(s)")
+                        print(f"  Downloaded exchanges: {', '.join(exchange_names)}")
+                        add_log('INFO', f'Symbol download completed after login', {
+                            'total_symbols': total_symbols,
+                            'exchanges': exchange_names,
+                            'exchange_count': len([f for f in downloaded_files.values() if f.get('file_path')])
+                        })
+                    except Exception as e:
+                        error_msg = f"Error downloading symbols after login: {str(e)}"
+                        print(error_msg)
+                        add_log('WARNING', error_msg, {'error': str(e)})
+                        # Don't fail login if symbol download fails
+                
+                # Start symbol download in background thread
+                symbol_thread = threading.Thread(target=download_symbols_background, daemon=True)
+                symbol_thread.start()
+                print("Symbol download started in background thread")
+                
+                return jsonify({
+                    "success": True, 
+                    "message": "Login successful. Downloading symbols in background...",
+                    "downloading_symbols": True
+                })
             except Exception as e:
                 print(f"Error verifying login: {e}")
                 return jsonify({"success": False, "message": f"Login completed but verification failed: {str(e)}"}), 401
@@ -1835,11 +1964,22 @@ def load_csv_data():
         # Convert date column to datetime
         df['date'] = pd.to_datetime(df['date'])
         
+        # Ensure dates are in IST timezone
+        # If dates are timezone-naive, assume they're already in IST and localize them
+        # If dates are timezone-aware, convert them to IST
+        if df['date'].dt.tz is None:
+            # Timezone-naive: assume IST and localize
+            df['date'] = df['date'].dt.tz_localize('Asia/Kolkata')
+        else:
+            # Timezone-aware: convert to IST
+            df['date'] = df['date'].dt.tz_convert('Asia/Kolkata')
+        
         # Sort by date
         df = df.sort_values('date')
         
         # Convert to format expected by frontend
-        timestamps = df['date'].dt.strftime('%Y-%m-%d %H:%M:%S').tolist()
+        # Format as ISO string with IST timezone offset (+05:30) so JavaScript can parse it correctly
+        timestamps = df['date'].dt.strftime('%Y-%m-%dT%H:%M:%S+05:30').tolist()
         iv_values = df['iv'].fillna(0).tolist()
         close_prices = df['close'].tolist() if 'close' in df.columns else []
         fclose_prices = df['fclose'].tolist() if 'fclose' in df.columns else []
@@ -1932,6 +2072,195 @@ def clear_logs():
     app_logs = []
     add_log('INFO', 'Logs cleared by user')
     return jsonify({"success": True, "message": "Logs cleared"})
+
+@app.route('/api/download_symbols', methods=['POST'])
+def download_symbols():
+    """Download all Fyers symbols from Symbol Master JSON files
+    
+    Exchange options:
+    - None or 'ALL': Download all exchanges
+    - 'NSE': Download all NSE segments (NSE_CM, NSE_FO, NSE_CD, NSE_COM)
+    - 'MCX': Download MCX_COM
+    - 'BSE': Download all BSE segments (BSE_CM, BSE_FO)
+    - Specific segment: 'NSE_CM', 'NSE_FO', 'NSE_CD', 'NSE_COM', 'BSE_CM', 'BSE_FO', 'MCX_COM'
+    - List of segments: ['MCX_COM', 'NSE_FO'] - Download multiple specific segments
+    """
+    try:
+        from FyresIntegration import download_fyers_symbols
+        
+        data = request.json or {}
+        exchange = data.get('exchange')  # Optional: 'NSE', 'MCX', 'BSE', specific segment, or list like ['MCX_COM', 'NSE_FO']
+        save_path = data.get('save_path', 'fyers_symbols')
+        
+        exchange_display = exchange if exchange else 'ALL'
+        if isinstance(exchange, list):
+            exchange_display = ', '.join(exchange)
+        
+        print(f"Downloading Fyers symbols (exchange: {exchange_display})...")
+        add_log('INFO', f'Downloading Fyers symbols', {'exchange': exchange_display, 'save_path': save_path})
+        
+        downloaded_files = download_fyers_symbols(exchange=exchange, save_path=save_path)
+        
+        # Count total symbols downloaded
+        total_symbols = sum(f.get('symbol_count', 0) for f in downloaded_files.values() if f.get('file_path'))
+        
+        return jsonify({
+            "success": True,
+            "message": f"Downloaded symbols from {len([f for f in downloaded_files.values() if f.get('file_path')])} exchange(s)",
+            "files": downloaded_files,
+            "total_symbols": total_symbols
+        })
+    except Exception as e:
+        error_msg = f"Error downloading symbols: {str(e)}"
+        print(error_msg)
+        add_log('ERROR', error_msg, {'error': str(e)})
+        import traceback
+        traceback.print_exc()
+        return jsonify({"success": False, "message": error_msg}), 500
+
+@app.route('/api/search_symbols', methods=['GET'])
+def search_symbols_endpoint():
+    """Search for symbols in downloaded Symbol Master files"""
+    try:
+        from FyresIntegration import search_symbols
+        
+        query = request.args.get('query', '')
+        exchange = request.args.get('exchange')  # Optional exchange filter
+        symbols_dir = request.args.get('symbols_dir', 'fyers_symbols')
+        
+        if not query:
+            return jsonify({"success": False, "message": "Query parameter is required"}), 400
+        
+        print(f"Searching symbols: query='{query}', exchange={exchange or 'ALL'}")
+        
+        results = search_symbols(query=query, exchange=exchange, symbols_dir=symbols_dir)
+        
+        return jsonify({
+            "success": True,
+            "query": query,
+            "exchange": exchange,
+            "results": results,
+            "count": len(results)
+        })
+    except Exception as e:
+        error_msg = f"Error searching symbols: {str(e)}"
+        print(error_msg)
+        add_log('ERROR', error_msg, {'error': str(e), 'query': query})
+        return jsonify({"success": False, "message": error_msg}), 500
+
+@app.route('/api/list_symbol_files', methods=['GET'])
+def list_symbol_files():
+    """List all downloaded symbol CSV files"""
+    try:
+        import os
+        
+        symbols_dir = request.args.get('symbols_dir', 'fyers_symbols')
+        
+        if not os.path.exists(symbols_dir):
+            return jsonify({
+                "success": True,
+                "message": "Symbols directory does not exist. Download symbols first.",
+                "files": [],
+                "count": 0,
+                "master_file": None
+            })
+        
+        csv_files = [f for f in os.listdir(symbols_dir) if f.endswith('_symbols.csv')]
+        
+        file_info = []
+        master_file_info = None
+        
+        for csv_file in csv_files:
+            file_path = os.path.join(symbols_dir, csv_file)
+            
+            # Check if it's the master file
+            if csv_file == 'fyers_master_symbols.csv':
+                exchange = 'MASTER'
+                is_master = True
+            else:
+                exchange = csv_file.replace('_symbols.csv', '')
+                is_master = False
+            
+            # Count symbols in file
+            symbol_count = 0
+            try:
+                import csv
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    reader = csv.reader(f)
+                    symbol_count = sum(1 for row in reader) - 1  # Exclude header
+            except:
+                pass
+            
+            file_data = {
+                'filename': csv_file,
+                'exchange': exchange,
+                'file_path': file_path,
+                'symbol_count': symbol_count,
+                'is_master': is_master
+            }
+            
+            if is_master:
+                master_file_info = file_data
+            else:
+                file_info.append(file_data)
+        
+        return jsonify({
+            "success": True,
+            "files": file_info,
+            "count": len(file_info),
+            "total_symbols": sum(f['symbol_count'] for f in file_info),
+            "master_file": master_file_info
+        })
+    except Exception as e:
+        error_msg = f"Error listing symbol files: {str(e)}"
+        print(error_msg)
+        return jsonify({"success": False, "message": error_msg}), 500
+
+@app.route('/api/create_master_symbols', methods=['POST'])
+def create_master_symbols():
+    """Create or update the master symbols CSV file"""
+    try:
+        from FyresIntegration import create_master_symbols_csv
+        
+        data = request.json or {}
+        symbols_dir = data.get('symbols_dir', 'fyers_symbols')
+        master_file = data.get('master_file', 'fyers_master_symbols.csv')
+        
+        print(f"Creating master symbols file from {symbols_dir}...")
+        add_log('INFO', 'Creating master symbols CSV file', {'symbols_dir': symbols_dir, 'master_file': master_file})
+        
+        master_path = create_master_symbols_csv(symbols_dir=symbols_dir, master_file=master_file)
+        
+        if master_path:
+            # Count symbols in master file
+            import csv
+            symbol_count = 0
+            try:
+                with open(master_path, 'r', encoding='utf-8') as f:
+                    reader = csv.reader(f)
+                    symbol_count = sum(1 for row in reader) - 1  # Exclude header
+            except:
+                pass
+            
+            return jsonify({
+                "success": True,
+                "message": f"Master symbols file created successfully",
+                "master_file": master_path,
+                "symbol_count": symbol_count
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "message": "Failed to create master symbols file. Check if symbol files exist."
+            }), 500
+            
+    except Exception as e:
+        error_msg = f"Error creating master symbols file: {str(e)}"
+        print(error_msg)
+        add_log('ERROR', error_msg, {'error': str(e)})
+        import traceback
+        traceback.print_exc()
+        return jsonify({"success": False, "message": error_msg}), 500
 
 if __name__ == '__main__':
     import webbrowser
