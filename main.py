@@ -287,14 +287,40 @@ def generate_future_symbol_from_settings(prefix, symbol, expiry_date):
     Generate future symbol from settings format
     Format: {PREFIX}:{SYMBOL}{YEARFROMDATE}{MONTHFROMDATE}{FUT}
     Example: NSE:NIFTY25NOVFUT
+    For MCX: {PREFIX}:{SYMBOL}{MONTHCODE}{YEARFROMDATE}{MONTHFROMDATE}{FUT}
+    Example: MCX:CRUDEOILZ25DECFUT (Z is month code for December)
     """
     try:
         year_2digit = expiry_date.strftime('%y')  # e.g., "25"
         month_abbr = expiry_date.strftime('%b').upper()  # e.g., "NOV"
-        future_symbol = f"{prefix}:{symbol}{year_2digit}{month_abbr}FUT"
+        
+        # Check if it's MCX - MCX futures need month code
+        is_mcx = prefix.upper() == 'MCX'
+        
+        if is_mcx:
+            # MCX month codes: F=Jan, G=Feb, H=Mar, J=Apr, K=May, M=Jun, 
+            #                  N=Jul, Q=Aug, U=Sep, V=Oct, X=Nov, Z=Dec
+            month_code_map = {
+                1: 'F', 2: 'G', 3: 'H', 4: 'J', 5: 'K', 6: 'M',
+                7: 'N', 8: 'Q', 9: 'U', 10: 'V', 11: 'X', 12: 'Z'
+            }
+            month_code = month_code_map.get(expiry_date.month, '')
+            if not month_code:
+                print(f"Error: Invalid month {expiry_date.month} for MCX")
+                return None
+            # MCX format: MCX:COMMODITY + MONTHCODE + YY + MONTH + FUT
+            # e.g., MCX:CRUDEOILZ25DECFUT
+            future_symbol = f"{prefix}:{symbol}{month_code}{year_2digit}{month_abbr}FUT"
+        else:
+            # NSE format: NSE:SYMBOL + YY + MONTH + FUT
+            # e.g., NSE:NIFTY25NOVFUT
+            future_symbol = f"{prefix}:{symbol}{year_2digit}{month_abbr}FUT"
+        
         return future_symbol
     except Exception as e:
         print(f"Error generating future symbol: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 def save_iv_to_csv(symbol, df_with_iv, timeframe=None, strike=None, expiry=None, option_type=None):
@@ -603,20 +629,45 @@ def get_future_symbol(underlying, expiry_date):
         # MCX underlying format: COMMODITY + MONTHCODE (e.g., CRUDEOILM, GOLDM, SILVERM)
         # MCX future format: MCX:COMMODITY + MONTHCODE + YY + MONTH + FUT
         # e.g., MCX:CRUDEOILM25NOVFUT
-        mcx_commodities = ['CRUDEOIL', 'GOLD', 'SILVER', 'COPPER', 'ZINC', 'LEAD', 'NICKEL', 'ALUMINIUM']
+        mcx_commodities = ['CRUDEOIL', 'GOLD', 'SILVER', 'COPPER', 'ZINC', 'LEAD', 'NICKEL', 'ALUMINIUM', 'NATURALGAS']
         underlying_upper = underlying.upper()
         
         # Check if underlying starts with any MCX commodity name
         is_mcx = False
+        matched_commodity = None
         for commodity in mcx_commodities:
             if underlying_upper.startswith(commodity):
                 is_mcx = True
+                matched_commodity = commodity
                 break
         
         if is_mcx:
             # MCX future: MCX:COMMODITY + MONTHCODE + YY + MONTH + FUT
             # e.g., MCX:CRUDEOILM25NOVFUT
-            future_symbol = f"MCX:{underlying}{year_2digit}{month_code}FUT"
+            # Check if underlying already has a month code (single letter at end)
+            # MCX month codes: F, G, H, J, K, M, N, Q, U, V, X, Z
+            mcx_month_codes = ['F', 'G', 'H', 'J', 'K', 'M', 'N', 'Q', 'U', 'V', 'X', 'Z']
+            
+            # Check if last character is a month code
+            has_month_code = matched_commodity and len(underlying) > len(matched_commodity) and underlying[-1].upper() in mcx_month_codes
+            
+            if not has_month_code:
+                # Underlying doesn't have month code, add it based on expiry date
+                # MCX month codes: F=Jan, G=Feb, H=Mar, J=Apr, K=May, M=Jun, 
+                #                  N=Jul, Q=Aug, U=Sep, V=Oct, X=Nov, Z=Dec
+                month_code_map = {
+                    1: 'F', 2: 'G', 3: 'H', 4: 'J', 5: 'K', 6: 'M',
+                    7: 'N', 8: 'Q', 9: 'U', 10: 'V', 11: 'X', 12: 'Z'
+                }
+                mcx_month_code = month_code_map.get(expiry_date.month, '')
+                if not mcx_month_code:
+                    print(f"Error: Invalid month {expiry_date.month} for MCX")
+                    return None
+                underlying_with_code = f"{underlying}{mcx_month_code}"
+            else:
+                underlying_with_code = underlying
+            
+            future_symbol = f"MCX:{underlying_with_code}{year_2digit}{month_code}FUT"
         else:
             return None
     
