@@ -27,7 +27,7 @@
                     <h2>Dashboard</h2>
                 </div>
                 <div class="header-right">
-                    <button id="loginBtn" class="btn-primary">Login to API</button>
+                    <button id="loginBtn" class="btn-primary" onclick="if(window.loginToAPI) window.loginToAPI(); else alert('Login function not loaded. Please refresh the page.');">Login to API</button>
                     <div class="user-profile">
                         <div class="profile-icon">👤</div>
                     </div>

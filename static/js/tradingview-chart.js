@@ -54,29 +54,38 @@ class ChartUpdateManager {
         }
         
         this.isProcessing = true;
+        console.log(`[ChartManager] Processing queue with ${this.updateQueue.length} updates`);
         
         while (this.updateQueue.length > 0) {
             const update = this.updateQueue.shift();
             
             try {
-                // Skip if symbol changed while in queue
+                // Skip if symbol changed while in queue (but allow if currentSymbol is null - first load)
                 if (update.symbol !== this.currentSymbol && this.currentSymbol !== null) {
                     console.log(`[ChartManager] Skipping queued update for ${update.symbol} (current: ${this.currentSymbol})`);
                     continue;
                 }
                 
+                console.log(`[ChartManager] Processing update for symbol: ${update.symbol}, data points: ${update.data?.timestamps?.length || 0}`);
                 await this.updateChart(update.symbol, update.data, update.source);
+                console.log(`[ChartManager] Successfully updated chart for ${update.symbol}`);
             } catch (error) {
                 console.error(`[ChartManager] Error processing update:`, error);
+                console.error(`[ChartManager] Error details:`, error.message, error.stack);
                 // On error, try to restore last valid data
                 if (this.lastValidData) {
                     console.log(`[ChartManager] Restoring last valid data due to error...`);
-                    await this.updateChart(this.currentSymbol, this.lastValidData.data, this.lastValidData.source);
+                    try {
+                        await this.updateChart(this.currentSymbol, this.lastValidData.data, this.lastValidData.source);
+                    } catch (restoreError) {
+                        console.error(`[ChartManager] Failed to restore last valid data:`, restoreError);
+                    }
                 }
             }
         }
         
         this.isProcessing = false;
+        console.log(`[ChartManager] Queue processing complete`);
     }
     
     /**
@@ -107,11 +116,24 @@ class ChartUpdateManager {
             // Convert timestamp
             let time;
             try {
+                // Log first and last few timestamps for debugging
+                if (index < 3 || index >= data.timestamps.length - 3) {
+                    console.log(`[ChartManager] Converting timestamp ${index}: "${timestamp}"`);
+                }
                 time = convertToIST(timestamp);
                 if (!time || isNaN(time) || time <= 0) {
+                    if (index < 3 || index >= data.timestamps.length - 3) {
+                        console.warn(`[ChartManager] Invalid converted time at index ${index}: ${time}`);
+                    }
                     continue;
                 }
+                // Log converted time for first and last few
+                if (index < 3 || index >= data.timestamps.length - 3) {
+                    const convertedDate = new Date(time * 1000);
+                    console.log(`[ChartManager] Converted to Unix: ${time}, displays as: ${convertedDate.toLocaleString()}`);
+                }
             } catch (e) {
+                console.error(`[ChartManager] Error converting timestamp at index ${index}:`, e);
                 continue;
             }
             
@@ -121,10 +143,16 @@ class ChartUpdateManager {
             }
             seenTimes.add(time);
             
-            // Validate IV value
+            // Validate IV value (allow 0 and positive values)
             const parsedIv = parseFloat(ivValue);
             if (isNaN(parsedIv) || parsedIv < 0) {
+                console.warn(`[ChartManager] Skipping invalid IV value at index ${index}: ${ivValue}`);
                 continue;
+            }
+            
+            // Log first few valid IV values for debugging
+            if (index < 3) {
+                console.log(`[ChartManager] Valid IV value at index ${index}: ${parsedIv}%`);
             }
             
             // Get option and underlying prices
@@ -149,6 +177,26 @@ class ChartUpdateManager {
         // Sort by time
         chartData.sort((a, b) => a.time - b.time);
         
+        // Limit to latest 500 records for chart display
+        const MAX_CHART_RECORDS = 500;
+        if (chartData.length > MAX_CHART_RECORDS) {
+            // Keep only the latest 500 records
+            const startIndex = chartData.length - MAX_CHART_RECORDS;
+            chartData = chartData.slice(startIndex);
+            
+            // Also update dataMap to only include the latest 500 records
+            const latestTimes = new Set(chartData.map(d => d.time));
+            const filteredDataMap = new Map();
+            for (const [time, value] of dataMap.entries()) {
+                if (latestTimes.has(time)) {
+                    filteredDataMap.set(time, value);
+                }
+            }
+            dataMap = filteredDataMap;
+            
+            console.log(`[ChartManager] Limited chart display to latest ${MAX_CHART_RECORDS} records (from ${data.timestamps.length} total)`);
+        }
+        
         // Remove flat trailing segments (consecutive same values at end)
         if (chartData.length > 2) {
             const lastValue = chartData[chartData.length - 1].value;
@@ -166,9 +214,16 @@ class ChartUpdateManager {
         }
         
         if (chartData.length === 0) {
+            console.error('[ChartManager] No valid data points after validation. Input data:', {
+                timestamps: data.timestamps?.length || 0,
+                iv_values: data.iv_values?.length || 0,
+                sampleTimestamps: data.timestamps?.slice(0, 5),
+                sampleIVs: data.iv_values?.slice(0, 5)
+            });
             throw new Error('No valid data points after validation');
         }
         
+        console.log(`[ChartManager] Validated ${chartData.length} data points from ${data.timestamps.length} input points`);
         return { chartData, dataMap };
     }
     
@@ -205,26 +260,36 @@ class ChartUpdateManager {
         
         // Update chart title
         updateChartTitle(symbol);
+        
+        // Check if this is a new symbol or first load (check BEFORE updating currentSymbol)
+        const existingData = series.data();
+        const previousSymbol = this.currentSymbol;
+        const isNewSymbol = existingData.length === 0 || symbol !== previousSymbol;
+        
+        // Update currentSymbol AFTER checking
         this.currentSymbol = symbol;
         
-        // Check if this is a new symbol or first load
-        const existingData = series.data();
-        const isNewSymbol = existingData.length === 0 || symbol !== this.currentSymbol;
+        console.log(`[ChartManager] Updating chart: symbol=${symbol}, isNewSymbol=${isNewSymbol}, existingDataLength=${existingData.length}, previousSymbol=${previousSymbol}`);
         
         try {
             if (isNewSymbol || existingData.length === 0) {
                 // New symbol: Clear and set all data
                 console.log(`[ChartManager] Setting ${chartData.length} data points for new symbol: ${symbol}`);
+                console.log(`[ChartManager] Sample data points:`, chartData.slice(0, 3));
                 series.setData([]);
                 await this.wait(50);
                 series.setData(chartData);
                 
                 // Verify data was set
-                await this.wait(50);
+                await this.wait(100);
                 const verifyData = series.data();
+                console.log(`[ChartManager] Verification: series.data() returned ${verifyData.length} points`);
                 if (verifyData.length === 0 && chartData.length > 0) {
                     console.warn('[ChartManager] Data not set, retrying...');
                     series.setData(chartData);
+                    await this.wait(100);
+                    const verifyData2 = series.data();
+                    console.log(`[ChartManager] After retry: series.data() returned ${verifyData2.length} points`);
                 }
                 
                 // Update data map
@@ -360,121 +425,90 @@ class ChartUpdateManager {
 // Create global chart update manager instance
 const chartUpdateManager = new ChartUpdateManager();
 
-// Helper function to convert IST timestamp string to Unix timestamp
+// Helper function to convert timestamp string to Unix timestamp
 // Timestamps from backend are in IST format: "2025-11-13T15:29:00+05:30" or "2025-11-13 15:29:00"
-// CSV timestamps are timezone-naive strings that represent IST times
-// We need to create a Unix timestamp that represents this IST time correctly
-// The chart library displays times in the browser's local timezone, so we need to ensure
-// the Unix timestamp represents the correct IST moment in time
+// CSV timestamps are correct IST times - we need to display them as IST on the chart
+// LightweightCharts displays times in browser's local timezone, so we adjust the Unix timestamp
+// so that when displayed, it shows the IST time from CSV
 function convertToIST(timestamp) {
     try {
         if (typeof timestamp === 'string') {
-            // Check if timestamp already has timezone info (e.g., "+05:30")
-            if (timestamp.includes('+05:30')) {
-                // Already has IST timezone info, parse directly
-                const istDate = new Date(timestamp);
-                if (!isNaN(istDate.getTime())) {
-                    return Math.floor(istDate.getTime() / 1000);
-                }
-            }
+            // Extract IST time components from CSV timestamp
+            // Backend sends: "2025-12-01T17:30:00+05:30" (IST time with timezone indicator)
+            let csvYear, csvMonth, csvDay, csvHour, csvMinute, csvSecond;
             
-            // Parse timestamp string (format: "2025-11-13 15:29:00" or "2025-11-13T15:29:00")
-            // Remove any existing timezone info if present
+            // Parse timestamp string to extract date/time components (before timezone)
+            // Remove timezone info first to get clean timestamp
             let cleanTimestamp = timestamp.replace(/[+-]\d{2}:\d{2}$/, '').trim();
-            
-            // Try to parse the date components
             const match = cleanTimestamp.match(/(\d{4})-(\d{2})-(\d{2})[\sT](\d{2}):(\d{2}):(\d{2})/);
-            if (match) {
-                const [, year, month, day, hour, minute, second] = match;
-                
-                // Parse components as integers
-                const yearInt = parseInt(year);
-                const monthInt = parseInt(month) - 1; // Month is 0-indexed
-                const dayInt = parseInt(day);
-                const hourInt = parseInt(hour);
-                const minuteInt = parseInt(minute);
-                const secondInt = parseInt(second || 0);
-                
-                // CRITICAL: Timestamps from CSV are in IST (UTC+5:30)
-                // CSV times like "2025-11-13 11:55:00" represent IST time (11:55 AM IST)
-                // We want the chart to display IST times regardless of browser timezone
-                // 
-                // Strategy: Create a Unix timestamp that represents the IST moment correctly,
-                // then adjust it so the chart displays IST time even if browser is in different timezone
-                
-                // Parse as IST time with explicit timezone
-                const istTimestampString = `${yearInt}-${String(monthInt + 1).padStart(2, '0')}-${String(dayInt).padStart(2, '0')}T${String(hourInt).padStart(2, '0')}:${String(minuteInt).padStart(2, '0')}:${String(secondInt).padStart(2, '0')}+05:30`;
-                const istDate = new Date(istTimestampString);
-                
-                if (!isNaN(istDate.getTime())) {
-                    // Get the Unix timestamp (this represents the correct IST moment in UTC)
-                    let unixTimestampMs = istDate.getTime();
-                    
-                    // Get browser timezone offset (minutes behind UTC, positive = behind UTC)
-                    const browserOffsetMinutes = new Date().getTimezoneOffset();
-                    const istOffsetMinutes = -330; // IST is UTC+5:30 = -330 minutes
-                    
-                    // Calculate difference: how many minutes different is browser from IST?
-                    const offsetDiffMinutes = browserOffsetMinutes - istOffsetMinutes;
-                    
-                    // Adjust timestamp: if browser is ahead of IST, we need to add time
-                    // so that when chart displays in browser timezone, it shows IST time
-                    // Example: Browser in UTC (0 offset), IST is +5:30
-                    // We want chart to show 11:55 IST, so we send timestamp for 11:55 UTC
-                    // which will display as 11:55 in UTC browser, but represents 17:25 IST moment
-                    // So we need to subtract the difference to make it display correctly
-                    unixTimestampMs = unixTimestampMs - (offsetDiffMinutes * 60 * 1000);
-                    
-                    return Math.floor(unixTimestampMs / 1000);
-                }
-                
-                // Fallback: Create UTC date and manually adjust
-                // IST 11:55:00 = UTC 06:25:00 (subtract 5:30)
-                let utcHour = hourInt;
-                let utcMinute = minuteInt;
-                let utcDay = dayInt;
-                
-                // Subtract 5:30 from IST time to get UTC
-                utcMinute -= 30;
-                if (utcMinute < 0) {
-                    utcMinute += 60;
-                    utcHour -= 1;
-                }
-                utcHour -= 5;
-                if (utcHour < 0) {
-                    utcHour += 24;
-                    utcDay -= 1;
-                }
-                
-                const utcDate = new Date(Date.UTC(yearInt, monthInt, utcDay, utcHour, utcMinute, secondInt));
-                let unixTimestampMs = utcDate.getTime();
-                
-                // Adjust for browser timezone to display IST
-                const browserOffsetMinutes_fallback = new Date().getTimezoneOffset();
-                const istOffsetMinutes_fallback = -330;
-                const offsetDiffMinutes_fallback = browserOffsetMinutes_fallback - istOffsetMinutes_fallback;
-                unixTimestampMs = unixTimestampMs - (offsetDiffMinutes_fallback * 60 * 1000);
-                
-                if (!isNaN(unixTimestampMs)) {
-                    return Math.floor(unixTimestampMs / 1000);
-                }
-                
-                return null;
-            } else {
-                // Try standard Date parsing as fallback
-                const date = new Date(timestamp);
-                if (!isNaN(date.getTime())) {
-                    return Math.floor(date.getTime() / 1000);
-                }
+            
+            if (!match) {
                 return null;
             }
+            
+            [, csvYear, csvMonth, csvDay, csvHour, csvMinute, csvSecond] = match;
+            
+            const yearInt = parseInt(csvYear);
+            const monthInt = parseInt(csvMonth) - 1; // Month is 0-indexed
+            const dayInt = parseInt(csvDay);
+            const hourInt = parseInt(csvHour);
+            const minuteInt = parseInt(csvMinute);
+            const secondInt = parseInt(csvSecond || 0);
+            
+            // CSV has IST time (e.g., 17:30:00 IST)
+            // We want chart to display: 17:30:00 (matching CSV)
+            // Chart library displays Unix timestamps in browser's local timezone
+            
+            // Simple strategy: Treat CSV IST time as UTC time for the Unix timestamp
+            // This makes the chart display the CSV time directly, regardless of browser timezone
+            // Example: CSV "17:30:00 IST" -> Create Unix timestamp for "17:30:00 UTC"
+            // - Browser in UTC: displays "17:30:00" ✓ (matches CSV)
+            // - Browser in IST: displays "23:00:00" (17:30 + 5:30) - but we want 17:30
+            //
+            // To handle IST browsers: We need to subtract 5:30 so it displays as IST time
+            // But we want to show IST time, so if browser is IST, we use actual UTC (which displays as IST)
+            
+            // Always treat CSV IST time as UTC for the Unix timestamp
+            // This makes chart display CSV time directly in UTC browsers
+            // For IST browsers, we'll adjust below
+            const istAsUTC = new Date(Date.UTC(yearInt, monthInt, dayInt, hourInt, minuteInt, secondInt));
+            
+            // Get browser's timezone offset (in minutes, positive = behind UTC)
+            // IST is UTC+5:30, so IST offset is -330 minutes
+            const browserOffsetMinutes = new Date().getTimezoneOffset();
+            const istOffsetMinutes = -330;
+            
+            // Check if browser is in IST (within 10 minutes tolerance for DST, etc.)
+            const isISTBrowser = Math.abs(browserOffsetMinutes - istOffsetMinutes) < 10;
+            
+            // Debug logging for first few conversions
+            const shouldLog = yearInt === 2025 && monthInt === 11 && dayInt === 1 && hourInt >= 17;
+            
+            if (shouldLog) {
+                console.log(`[convertToIST] Input: ${timestamp}, Extracted: ${yearInt}-${monthInt+1}-${dayInt} ${hourInt}:${minuteInt}:${secondInt}`);
+                console.log(`[convertToIST] Browser offset: ${browserOffsetMinutes}, IST offset: ${istOffsetMinutes}, Is IST browser: ${isISTBrowser}`);
+            }
+            
+            // The chart appears to display Unix timestamps in UTC (based on evidence: showing 12:07 instead of 17:35)
+            // We want to display the CSV IST time directly
+            // Strategy: Always use CSV IST time as UTC timestamp
+            // CSV 17:30 IST -> timestamp for 17:30 UTC -> chart displays as 17:30 ✓
+            // This works regardless of browser timezone if chart displays in UTC
+            
+            const unixTs = Math.floor(istAsUTC.getTime() / 1000);
+            if (shouldLog) {
+                const displayDate = new Date(unixTs * 1000);
+                console.log(`[convertToIST] Using CSV IST time as UTC: ${unixTs} (${displayDate.toUTCString()}), chart should display: ${displayDate.toUTCString().match(/\d{2}:\d{2}:\d{2}/)?.[0]}`);
+            }
+            return unixTs;
+            
         } else if (typeof timestamp === 'number') {
             // If it's already a Unix timestamp, return as-is (Unix timestamps are timezone-agnostic)
             return timestamp > 10000000000 ? Math.floor(timestamp / 1000) : timestamp;
         }
         return null;
     } catch (e) {
-        console.warn('Error converting timestamp to IST:', timestamp, e);
+        console.warn('Error converting timestamp:', timestamp, e);
         return null;
     }
 }
@@ -853,13 +887,25 @@ async function fetchIVData(symbol) {
         const response = await fetch(`/api/get_iv_data?symbol=${encodeURIComponent(symbol)}`);
         
         if (!response.ok) {
+            console.error(`[fetchIVData] HTTP error ${response.status}: ${response.statusText}`);
             throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
         
         const data = await response.json();
         
+        console.log('[fetchIVData] Raw response data:', {
+            hasData: !!data,
+            timestamps: data?.timestamps?.length || 0,
+            iv_values: data?.iv_values?.length || 0,
+            close_prices: data?.close_prices?.length || 0,
+            fclose_prices: data?.fclose_prices?.length || 0,
+            firstFewTimestamps: data?.timestamps?.slice(0, 3),
+            firstFewIVs: data?.iv_values?.slice(0, 3)
+        });
+        
         if (!data || !data.timestamps || data.timestamps.length === 0) {
-            console.warn('[fetchIVData] No data received or empty timestamps');
+            console.warn('[fetchIVData] No data received or empty timestamps for symbol:', symbol);
+            console.warn('[fetchIVData] Response data:', data);
             // Try to use last valid data if available
             if (chartUpdateManager.lastValidData) {
                 console.log('[fetchIVData] Using last valid data as fallback');
@@ -868,15 +914,24 @@ async function fetchIVData(symbol) {
             return;
         }
         
+        // Check if IV values are all zero or invalid
+        const validIVs = data.iv_values.filter(iv => !isNaN(parseFloat(iv)) && parseFloat(iv) >= 0);
+        if (validIVs.length === 0) {
+            console.warn('[fetchIVData] All IV values are invalid or NaN. IV values:', data.iv_values.slice(0, 10));
+        }
+        
         console.log('[fetchIVData] Received IV data:', {
             timestamps: data.timestamps.length,
             iv_values: data.iv_values?.length || 0,
+            validIVs: validIVs.length,
             close_prices: data.close_prices?.length || 0,
             fclose_prices: data.fclose_prices?.length || 0
         });
         
         // Queue update through ChartUpdateManager (handles all validation and updates)
+        console.log('[fetchIVData] Queueing chart update for symbol:', symbol);
         await chartUpdateManager.queueUpdate(symbol, data, 'api');
+        console.log('[fetchIVData] Chart update queued successfully');
         
         // Update currentSymbol tracking
         currentSymbol = symbol;
@@ -983,19 +1038,29 @@ window.loginToAPI = async function loginToAPI() {
     }
     
     try {
-        console.log('Sending login request...');
+        console.log('Sending login request to /api/login...');
         
         // Create abort controller for timeout (more compatible)
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 60000); // 60 seconds timeout
         
-        const response = await fetch('/api/login', {
+        let response;
+        try {
+            response = await fetch('/api/login', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
             },
             signal: controller.signal
         });
+        } catch (fetchError) {
+            clearTimeout(timeoutId);
+            console.error('Fetch error:', fetchError);
+            if (fetchError.name === 'AbortError') {
+                throw new Error('Login request timed out after 60 seconds. Please check your connection and try again.');
+            }
+            throw new Error(`Failed to connect to server: ${fetchError.message}`);
+        }
         
         clearTimeout(timeoutId);
         
@@ -1102,16 +1167,27 @@ async function loadSymbolSettings() {
 // Populate future symbol dropdown
 function populateFutureSymbolDropdown(symbols) {
     const dropdown = document.getElementById('futureSymbol');
+    if (!dropdown) {
+        console.error('Future symbol dropdown not found');
+        return;
+    }
+    
     dropdown.innerHTML = '<option value="">Select Future Symbol</option>';
     
-    symbols.forEach(sym => {
+    console.log(`[populateFutureSymbolDropdown] Loading ${symbols.length} symbols into dropdown`);
+    
+    symbols.forEach((sym, index) => {
         const option = document.createElement('option');
         option.value = sym.future_symbol;
         option.textContent = sym.future_symbol;
         option.dataset.strikeStep = sym.strike_step || '';
         option.dataset.expiryDate = sym.expiry_date || '';
+        option.dataset.originalSymbol = sym.symbol || ''; // Store original symbol for debugging
         dropdown.appendChild(option);
+        console.log(`[populateFutureSymbolDropdown] Added option ${index + 1}: ${sym.future_symbol} (original: ${sym.symbol})`);
     });
+    
+    console.log(`[populateFutureSymbolDropdown] Total options in dropdown: ${dropdown.options.length}`);
     
     // Select first option if available
     if (symbols.length > 0) {
@@ -1486,14 +1562,34 @@ function startPollingIVData(symbol) {
                 const status = await statusResponse.json();
                 if (status.active && status.mode === 'automatic' && status.symbol) {
                     // Use the current symbol from status (updated every second in automatic mode)
+                    const currentStatusSymbol = status.symbol;
+                    
+                    // If symbol changed, reset chart
+                    if (currentStatusSymbol && currentStatusSymbol !== currentSymbol) {
+                        console.log(`[Polling] Symbol changed from ${currentSymbol} to ${currentStatusSymbol} - resetting chart`);
+                        resetChart();
+                        currentSymbol = currentStatusSymbol;
+                        await new Promise(resolve => setTimeout(resolve, 300));
+                    }
+                    
                     // Update chart title if symbol changed
-                    updateChartTitle(status.symbol);
-                    fetchIVData(status.symbol);
+                    updateChartTitle(currentStatusSymbol);
+                    fetchIVData(currentStatusSymbol);
                 } else if (status.active && status.symbol) {
                     // Manual mode or fallback
+                    const currentStatusSymbol = status.symbol;
+                    
+                    // If symbol changed, reset chart
+                    if (currentStatusSymbol && currentStatusSymbol !== currentSymbol) {
+                        console.log(`[Polling] Symbol changed from ${currentSymbol} to ${currentStatusSymbol} - resetting chart`);
+                        resetChart();
+                        currentSymbol = currentStatusSymbol;
+                        await new Promise(resolve => setTimeout(resolve, 300));
+                    }
+                    
                     // Update chart title if symbol changed
-                    updateChartTitle(status.symbol);
-                    fetchIVData(status.symbol);
+                    updateChartTitle(currentStatusSymbol);
+                    fetchIVData(currentStatusSymbol);
                 } else {
                     // Fallback to original symbol
                     fetchIVData(symbol);
