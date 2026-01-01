@@ -714,37 +714,54 @@ def get_future_symbol(underlying, expiry_date):
         # MCX underlying format: COMMODITY (may have month code suffix like CRUDEOILM, GOLDM, SILVERM)
         # MCX future format: MCX:COMMODITY + YY + MONTH + FUT (NO month code letter)
         # e.g., MCX:CRUDEOIL25NOVFUT
+        # IMPORTANT: Contract variants (SILVERM, GOLDM) are different contracts, not month codes
+        contract_variants = ['SILVERM', 'GOLDM', 'SILVERMINI', 'GOLDMINI']
         mcx_commodities = ['CRUDEOIL', 'GOLD', 'SILVER', 'COPPER', 'ZINC', 'LEAD', 'NICKEL', 'ALUMINIUM', 'NATURALGAS']
         underlying_upper = underlying.upper()
         
-        # Check if underlying starts with any MCX commodity name
-        is_mcx = False
-        matched_commodity = None
-        for commodity in mcx_commodities:
-            if underlying_upper.startswith(commodity):
-                is_mcx = True
-                matched_commodity = commodity
+        # Check for contract variants FIRST (these are separate contracts, not month codes)
+        is_contract_variant = False
+        matched_variant = None
+        for variant in contract_variants:
+            if underlying_upper == variant or underlying_upper.startswith(variant):
+                is_contract_variant = True
+                matched_variant = variant
                 break
         
-        if is_mcx:
-            # MCX future: MCX:COMMODITY + YY + MONTH + FUT (NO month code letter)
-            # e.g., MCX:CRUDEOIL25NOVFUT
-            # Check if underlying already has a month code (single letter at end) and remove it
-            # MCX month codes: F, G, H, J, K, M, N, Q, U, V, X, Z
-            mcx_month_codes = ['F', 'G', 'H', 'J', 'K', 'M', 'N', 'Q', 'U', 'V', 'X', 'Z']
-            
-            # Remove month code from underlying if it exists
-            underlying_clean = underlying
-            if matched_commodity and len(underlying) > len(matched_commodity) and underlying[-1].upper() in mcx_month_codes:
-                # Remove the month code, keep only the commodity name
-                underlying_clean = matched_commodity
-            elif matched_commodity:
-                # Use the matched commodity name directly
-                underlying_clean = matched_commodity
-            
+        if is_contract_variant:
+            # For contract variants, preserve the full name (e.g., SILVERM -> MCX:SILVERM26JANFUT)
+            # Use the matched variant name (e.g., SILVERM, GOLDM)
+            underlying_clean = matched_variant
             future_symbol = f"MCX:{underlying_clean}{year_2digit}{month_code}FUT"
         else:
-            return None
+            # Check if underlying starts with any MCX commodity name
+            is_mcx = False
+            matched_commodity = None
+            for commodity in mcx_commodities:
+                if underlying_upper.startswith(commodity):
+                    is_mcx = True
+                    matched_commodity = commodity
+                    break
+            
+            if is_mcx:
+                # MCX future: MCX:COMMODITY + YY + MONTH + FUT (NO month code letter)
+                # e.g., MCX:CRUDEOIL25NOVFUT
+                # Check if underlying already has a month code (single letter at end) and remove it
+                # MCX month codes: F, G, H, J, K, M, N, Q, U, V, X, Z
+                mcx_month_codes = ['F', 'G', 'H', 'J', 'K', 'M', 'N', 'Q', 'U', 'V', 'X', 'Z']
+                
+                # Remove month code from underlying if it exists
+                underlying_clean = underlying
+                if matched_commodity and len(underlying) > len(matched_commodity) and underlying[-1].upper() in mcx_month_codes:
+                    # Remove the month code, keep only the commodity name
+                    underlying_clean = matched_commodity
+                elif matched_commodity:
+                    # Use the matched commodity name directly
+                    underlying_clean = matched_commodity
+                
+                future_symbol = f"MCX:{underlying_clean}{year_2digit}{month_code}FUT"
+            else:
+                return None
     
     return future_symbol
 
@@ -799,6 +816,11 @@ def generate_option_symbol(underlying, expiry_date, strike, option_type, expiry_
     - Option symbol string (e.g., "NSE:NIFTY25N1824500CE" for weekly or "MCX:CRUDEOIL25NOV25500CE" for MCX monthly)
     """
     try:
+        # Ensure underlying is a string and strip any whitespace
+        if underlying is None:
+            return None
+        underlying = str(underlying).strip()
+        
         # Extract year (last 2 digits)
         year_2digit = expiry_date.strftime('%y')  # e.g., "25" for 2025
         
@@ -824,31 +846,72 @@ def generate_option_symbol(underlying, expiry_date, strike, option_type, expiry_
         else:  # monthly
             if is_mcx:
                 # MCX monthly format: MCX:CRUDEOIL25DEC5300CE
-                # Remove month code from underlying (e.g., CRUDEOILM -> CRUDEOIL)
-                # MCX futures have month code (CRUDEOILM), but options don't use it
+                # Format: {Ex}:{Ex_Commodity}{YY}{MMM}{Strike}{Opt_Type}
+                # Examples: MCX:CRUDEOIL20OCT4000CE, MCX:GOLD20DEC40000PE
+                # 
+                # IMPORTANT: For contract variants (SILVERM, GOLDM), check if options exist
+                # Some variants may use the base commodity name in option symbols
                 underlying_clean = underlying
                 
-                # List of MCX commodities (base names without month codes)
-                mcx_commodities = ['CRUDEOIL', 'GOLD', 'SILVER', 'COPPER', 'ZINC', 'LEAD', 'NICKEL', 'ALUMINIUM', 'NATURALGAS']
+                # List of contract variants (these are separate contracts, NOT month codes)
+                contract_variants = ['SILVERM', 'GOLDM', 'SILVERMINI', 'GOLDMINI']
                 
-                # Remove month code from underlying if it exists
-                # Check if underlying starts with any commodity name
-                for commodity in mcx_commodities:
-                    if underlying_clean.upper().startswith(commodity):
-                        # If underlying is longer than commodity, it likely has a month code suffix
-                        if len(underlying_clean) > len(commodity):
-                            # Use just the commodity name (remove month code)
-                            underlying_clean = commodity
-                        else:
-                            # Already clean, use as is
-                            underlying_clean = commodity
+                # Check if underlying is a contract variant
+                is_variant = False
+                variant_name = None
+                for variant in contract_variants:
+                    if underlying_clean.upper() == variant or underlying_clean.upper().startswith(variant):
+                        variant_name = variant
+                        is_variant = True
                         break
+                
+                if is_variant:
+                    # For contract variants (SILVERM, GOLDM), options use the SAME variant name as the future
+                    # If user selected SILVERM future, generate SILVERM options (not SILVER)
+                    # If user selected GOLDM future, generate GOLDM options (not GOLD)
+                    # This ensures the option symbol matches the selected future symbol setting
+                    underlying_clean = variant_name
+                else:
+                    # Not a contract variant, check if it has a month code suffix
+                    # List of MCX commodities (base names without month codes)
+                    mcx_commodities = ['CRUDEOIL', 'GOLD', 'SILVER', 'COPPER', 'ZINC', 'LEAD', 'NICKEL', 'ALUMINIUM', 'NATURALGAS']
+                    mcx_month_codes = ['F', 'G', 'H', 'J', 'K', 'M', 'N', 'Q', 'U', 'V', 'X', 'Z']
+                    
+                    # Remove month code from underlying if it exists
+                    for commodity in mcx_commodities:
+                        if underlying_clean.upper().startswith(commodity):
+                            # Check if it's longer than commodity AND ends with a month code
+                            if len(underlying_clean) > len(commodity):
+                                last_char = underlying_clean[-1].upper()
+                                # Only remove if it's a month code (not a contract variant)
+                                if last_char in mcx_month_codes:
+                                    # Double-check it's not a variant
+                                    is_variant_check = False
+                                    for variant in contract_variants:
+                                        if underlying_clean.upper().startswith(variant):
+                                            is_variant_check = True
+                                            # Keep variant name for options (match the selected future symbol)
+                                            underlying_clean = variant
+                                            break
+                                    if not is_variant_check:
+                                        # It's a month code, remove it
+                                        underlying_clean = commodity
+                            else:
+                                # Already clean, use as is
+                                underlying_clean = commodity
+                            break
                 
                 # Extract month abbreviation (3 letters: JAN, FEB, MAR, etc.)
                 month_abbr = expiry_date.strftime('%b').upper()  # e.g., "DEC"
                 
                 # Format: MCX:COMMODITY + year + month_abbr + strike + option_suffix
-                # e.g., MCX:CRUDEOIL25DEC5300CE
+                # Format: {Ex}:{Ex_Commodity}{YY}{MMM}{Strike}{Opt_Type}
+                # e.g., MCX:CRUDEOIL25DEC5300CE, MCX:SILVERM26JAN230000CE (for SILVERM future)
+                # Ensure underlying_clean doesn't contain year digits (clean it)
+                underlying_clean = str(underlying_clean).strip()
+                # Remove any trailing digits that might have been incorrectly included
+                import re
+                underlying_clean = re.sub(r'\d+$', '', underlying_clean)
                 option_symbol = f"{exchange_prefix}{underlying_clean}{year_2digit}{month_abbr}{strike}{option_suffix}"
             else:
                 # NSE monthly format: NSE:NIFTY25NOV25500CE
@@ -968,6 +1031,15 @@ def safe_fetch_ohlc(symbol, timeframe):
     Safely fetch OHLC data with proper error handling
     """
     try:
+        # Ensure symbol is a string and strip any whitespace
+        symbol = str(symbol).strip() if symbol else None
+        if not symbol:
+            print(f"❌ ERROR: Invalid symbol provided to safe_fetch_ohlc: {symbol}")
+            return None
+        
+        # Debug: Print the symbol being passed to fetchOHLC
+        print(f"DEBUG safe_fetch_ohlc: Symbol being passed: '{symbol}' (type: {type(symbol)}, length: {len(symbol)})")
+        
         if FyresIntegration.fyers is None:
             print(f"❌ ERROR: Fyers not initialized. Cannot fetch data for {symbol}")
             return None
@@ -1492,26 +1564,50 @@ def fetch_data_loop_automatic(future_symbol, expiry_date, expiry_type, option_ty
                 else:
                     # Last resort: assume format is just COMMODITY, keep as is
                     underlying = base
-            # Also remove any trailing month code if present (for backward compatibility)
-            mcx_month_codes = ['F', 'G', 'H', 'J', 'K', 'M', 'N', 'Q', 'U', 'V', 'X', 'Z']
-            if underlying and len(underlying) > 0 and underlying[-1].upper() in mcx_month_codes:
-                # Check if it's a valid commodity name
-                mcx_commodities = ['CRUDEOIL', 'GOLD', 'SILVER', 'COPPER', 'ZINC', 'LEAD', 'NICKEL', 'ALUMINIUM', 'NATURALGAS']
-                for commodity in mcx_commodities:
-                    if underlying.upper().startswith(commodity) and len(underlying) > len(commodity):
-                        underlying = commodity
-                        break
+            # IMPORTANT: Check for contract variants FIRST (SILVERM, GOLDM are different contracts, not month codes)
+            # Contract variants should be preserved as-is
+            contract_variants = ['SILVERM', 'GOLDM', 'SILVERMINI', 'GOLDMINI']
+            is_contract_variant = False
+            for variant in contract_variants:
+                if underlying.upper() == variant or underlying.upper().startswith(variant):
+                    is_contract_variant = True
+                    # Preserve the contract variant name
+                    underlying = variant
+                    break
+            
+            # Only check for month codes if it's NOT a contract variant
+            if not is_contract_variant:
+                mcx_month_codes = ['F', 'G', 'H', 'J', 'K', 'M', 'N', 'Q', 'U', 'V', 'X', 'Z']
+                if underlying and len(underlying) > 0 and underlying[-1].upper() in mcx_month_codes:
+                    # Check if it's a valid commodity name
+                    mcx_commodities = ['CRUDEOIL', 'GOLD', 'SILVER', 'COPPER', 'ZINC', 'LEAD', 'NICKEL', 'ALUMINIUM', 'NATURALGAS']
+                    for commodity in mcx_commodities:
+                        if underlying.upper().startswith(commodity) and len(underlying) > len(commodity):
+                            underlying = commodity
+                            break
         else:
             # No FUT suffix, might be just the commodity
             underlying = underlying_part
-            # Remove month code if present
-            mcx_month_codes = ['F', 'G', 'H', 'J', 'K', 'M', 'N', 'Q', 'U', 'V', 'X', 'Z']
-            if underlying and len(underlying) > 0 and underlying[-1].upper() in mcx_month_codes:
-                mcx_commodities = ['CRUDEOIL', 'GOLD', 'SILVER', 'COPPER', 'ZINC', 'LEAD', 'NICKEL', 'ALUMINIUM', 'NATURALGAS']
-                for commodity in mcx_commodities:
-                    if underlying.upper().startswith(commodity) and len(underlying) > len(commodity):
-                        underlying = commodity
-                        break
+            
+            # IMPORTANT: Check for contract variants FIRST (SILVERM, GOLDM are different contracts, not month codes)
+            contract_variants = ['SILVERM', 'GOLDM', 'SILVERMINI', 'GOLDMINI']
+            is_contract_variant = False
+            for variant in contract_variants:
+                if underlying.upper() == variant or underlying.upper().startswith(variant):
+                    is_contract_variant = True
+                    # Preserve the contract variant name
+                    underlying = variant
+                    break
+            
+            # Only check for month codes if it's NOT a contract variant
+            if not is_contract_variant:
+                mcx_month_codes = ['F', 'G', 'H', 'J', 'K', 'M', 'N', 'Q', 'U', 'V', 'X', 'Z']
+                if underlying and len(underlying) > 0 and underlying[-1].upper() in mcx_month_codes:
+                    mcx_commodities = ['CRUDEOIL', 'GOLD', 'SILVER', 'COPPER', 'ZINC', 'LEAD', 'NICKEL', 'ALUMINIUM', 'NATURALGAS']
+                    for commodity in mcx_commodities:
+                        if underlying.upper().startswith(commodity) and len(underlying) > len(commodity):
+                            underlying = commodity
+                            break
     elif 'NIFTY' in underlying_part:
         if 'BANK' in underlying_part:
             underlying = 'BANKNIFTY'
@@ -1651,7 +1747,7 @@ def fetch_data_loop_automatic(future_symbol, expiry_date, expiry_type, option_ty
                             else:
                                 df_csv['date'] = df_csv['date'].dt.tz_convert('Asia/Kolkata')
                             df_csv = df_csv.sort_values('date')
-                            df_chart_csv = df_csv.tail(500) if len(df_csv) > 500 else df_csv
+                            df_chart_csv = df_csv  # Show all rows, no limit
                             timestamps_csv = df_chart_csv['date'].dt.strftime('%Y-%m-%dT%H:%M:%S+05:30').tolist()
                             iv_values_csv = df_chart_csv['iv'].fillna(0).tolist()
                             iv_data_store[symbol] = {
@@ -1710,7 +1806,7 @@ def fetch_data_loop_automatic(future_symbol, expiry_date, expiry_type, option_ty
                 
                 # Sort by date and get latest 500 records for chart display
                 df_with_iv = df_with_iv.sort_values('date')
-                df_chart = df_with_iv.tail(500) if len(df_with_iv) > 500 else df_with_iv
+                df_chart = df_with_iv  # Show all rows, no limit
                 
                 # Format timestamps with IST timezone info (+05:30) - only latest 500
                 timestamps_for_chart = df_chart['date'].dt.strftime('%Y-%m-%dT%H:%M:%S+05:30').tolist()
@@ -1725,7 +1821,7 @@ def fetch_data_loop_automatic(future_symbol, expiry_date, expiry_type, option_ty
                     "last_update": datetime.now().isoformat()
                 }
                 
-                print(f"✓ Stored IV data in iv_data_store for symbol: {symbol} ({len(timestamps_for_chart)} data points - latest 500 records)")
+                print(f"✓ Stored IV data in iv_data_store for symbol: {symbol} ({len(timestamps_for_chart)} data points - all records)")
                 print(f"  Debug: iv_data_store keys = {list(iv_data_store.keys())}")
                 print(f"  Debug: Current fetching_status.symbol = {fetching_status.get('symbol')}")
                 print(f"  Debug: Data stored with {len(timestamps_for_chart)} timestamps and {len(iv_values_for_chart)} IV values")
@@ -1905,15 +2001,15 @@ def fetch_data_loop(symbol, timeframe, manual_strike=None, manual_expiry=None, m
                         else:
                             df_with_iv['date'] = df_with_iv['date'].dt.tz_convert('Asia/Kolkata')
                         
-                        # Sort by date and get latest 500 records for chart display
+                        # Sort by date - show all records for chart display
                         df_with_iv = df_with_iv.sort_values('date')
-                        df_chart = df_with_iv.tail(500) if len(df_with_iv) > 500 else df_with_iv
+                        df_chart = df_with_iv  # Show all rows, no limit
                         
                         # Format timestamps with IST timezone info (+05:30) - only latest 500
                         timestamps_for_chart = df_chart['date'].dt.strftime('%Y-%m-%dT%H:%M:%S+05:30').tolist()
                         iv_values_for_chart = df_chart['iv'].fillna(0).tolist()
                         
-                        # Store IV data with timestamps - only latest 500 records for chart
+                        # Store IV data with timestamps - all records for chart
                         iv_data_store[symbol] = {
                             "timestamps": timestamps_for_chart,
                             "iv_values": iv_values_for_chart,
@@ -1925,7 +2021,7 @@ def fetch_data_loop(symbol, timeframe, manual_strike=None, manual_expiry=None, m
                         # Log IV statistics
                         non_zero_ivs = [iv for iv in iv_values_for_chart if iv > 0]
                         if non_zero_ivs:
-                            print(f"IV data stored: {len(non_zero_ivs)} non-zero values (range: {min(non_zero_ivs):.2f}% - {max(non_zero_ivs):.2f}%) - latest 500 records")
+                            print(f"IV data stored: {len(non_zero_ivs)} non-zero values (range: {min(non_zero_ivs):.2f}% - {max(non_zero_ivs):.2f}%) - all records")
                         else:
                             print(f"Warning: All IV values are zero for {symbol}")
                         
@@ -2258,26 +2354,53 @@ def start_fetching():
                         else:
                             # Last resort: assume format is just COMMODITY, keep as is
                             underlying = base
-                    # Also remove any trailing month code if present (for backward compatibility)
-                    mcx_month_codes = ['F', 'G', 'H', 'J', 'K', 'M', 'N', 'Q', 'U', 'V', 'X', 'Z']
-                    if underlying and len(underlying) > 0 and underlying[-1].upper() in mcx_month_codes:
-                        # Check if it's a valid commodity name
-                        mcx_commodities = ['CRUDEOIL', 'GOLD', 'SILVER', 'COPPER', 'ZINC', 'LEAD', 'NICKEL', 'ALUMINIUM', 'NATURALGAS']
-                        for commodity in mcx_commodities:
-                            if underlying.upper().startswith(commodity) and len(underlying) > len(commodity):
-                                underlying = commodity
-                                break
+                    # IMPORTANT: Check for contract variants FIRST (SILVERM, GOLDM are different contracts, not month codes)
+                    # These are separate contracts and should be preserved as-is
+                    contract_variants = ['SILVERM', 'GOLDM', 'SILVERMINI', 'GOLDMINI']
+                    underlying_upper = underlying.upper() if underlying else ''
+                    is_contract_variant = False
+                    # Check if underlying starts with a variant (might have trailing digits/chars)
+                    for variant in contract_variants:
+                        if underlying_upper == variant or underlying_upper.startswith(variant):
+                            # Extract just the variant name (remove any trailing characters)
+                            # This ensures we get "SILVERM" not "SILVERM26" or "SILVERM26FEB"
+                            underlying = variant
+                            is_contract_variant = True
+                            break
+                    
+                    # Only check for month codes if it's NOT a contract variant
+                    if not is_contract_variant:
+                        mcx_month_codes = ['F', 'G', 'H', 'J', 'K', 'M', 'N', 'Q', 'U', 'V', 'X', 'Z']
+                        if underlying and len(underlying) > 0 and underlying[-1].upper() in mcx_month_codes:
+                            # Check if it's a valid commodity name
+                            mcx_commodities = ['CRUDEOIL', 'GOLD', 'SILVER', 'COPPER', 'ZINC', 'LEAD', 'NICKEL', 'ALUMINIUM', 'NATURALGAS']
+                            for commodity in mcx_commodities:
+                                if underlying.upper().startswith(commodity) and len(underlying) > len(commodity):
+                                    # It's a month code, remove it
+                                    underlying = commodity
+                                    break
                 else:
                     # No FUT suffix, might be just the commodity
                     underlying = underlying_part
-                    # Remove month code if present
-                    mcx_month_codes = ['F', 'G', 'H', 'J', 'K', 'M', 'N', 'Q', 'U', 'V', 'X', 'Z']
-                    if underlying and len(underlying) > 0 and underlying[-1].upper() in mcx_month_codes:
-                        mcx_commodities = ['CRUDEOIL', 'GOLD', 'SILVER', 'COPPER', 'ZINC', 'LEAD', 'NICKEL', 'ALUMINIUM', 'NATURALGAS']
-                        for commodity in mcx_commodities:
-                            if underlying.upper().startswith(commodity) and len(underlying) > len(commodity):
-                                underlying = commodity
-                                break
+                    # IMPORTANT: Check for contract variants FIRST (SILVERM, GOLDM are different contracts)
+                    contract_variants = ['SILVERM', 'GOLDM', 'SILVERMINI', 'GOLDMINI']
+                    underlying_upper = underlying.upper() if underlying else ''
+                    is_variant = False
+                    for variant in contract_variants:
+                        if underlying_upper == variant or underlying_upper.startswith(variant):
+                            underlying = variant
+                            is_variant = True
+                            break
+                    
+                    if not is_variant:
+                        # Not a contract variant, check if it's a month code
+                        mcx_month_codes = ['F', 'G', 'H', 'J', 'K', 'M', 'N', 'Q', 'U', 'V', 'X', 'Z']
+                        if underlying and len(underlying) > 0 and underlying[-1].upper() in mcx_month_codes:
+                            mcx_commodities = ['CRUDEOIL', 'GOLD', 'SILVER', 'COPPER', 'ZINC', 'LEAD', 'NICKEL', 'ALUMINIUM', 'NATURALGAS']
+                            for commodity in mcx_commodities:
+                                if underlying.upper().startswith(commodity) and len(underlying) > len(commodity):
+                                    underlying = commodity
+                                    break
             elif 'NIFTY' in underlying_part:
                 if 'BANK' in underlying_part:
                     underlying = 'BANKNIFTY'
@@ -2336,7 +2459,10 @@ def start_fetching():
             # future_symbol already has the correct future expiry from SymbolSetting.csv
             # option_expiry_date is the OPTION expiry date from web input
             print(f"Generating option symbol: underlying={underlying}, expiry={option_expiry_date}, strike={atm_strike}, type={option_type}, expiry_type={expiry_type}, is_mcx={is_mcx}")
+            # Debug: Print the underlying before generating symbol
+            print(f"DEBUG: Underlying before symbol generation: '{underlying}' (type: {type(underlying)}, length: {len(underlying) if underlying else 0})")
             symbol = generate_option_symbol(underlying, option_expiry_date, atm_strike, option_type, expiry_type, is_mcx=is_mcx)
+            print(f"DEBUG: Generated symbol: '{symbol}'")
             
             if not symbol:
                 error_msg = f"Could not generate option symbol for underlying={underlying}, expiry={option_expiry_date}, strike={atm_strike}"
@@ -2422,7 +2548,7 @@ def start_fetching():
                 option_type=option_type
             )
             
-            # STEP 6: Store in iv_data_store for chart display (latest 500 records)
+            # STEP 6: Store in iv_data_store for chart display (all records)
             print("=" * 60)
             print("STEP 6: Preparing data for chart display...")
             print("=" * 60)
@@ -2435,8 +2561,8 @@ def start_fetching():
             # Sort by date and get latest records
             df_with_iv = df_with_iv.sort_values('date')
             
-            # Get latest 500 records for chart
-            df_chart = df_with_iv.tail(500) if len(df_with_iv) > 500 else df_with_iv
+            # Get all records for chart (no limit)
+            df_chart = df_with_iv
             
             timestamps_for_chart = df_chart['date'].dt.strftime('%Y-%m-%dT%H:%M:%S+05:30').tolist()
             iv_values_for_chart = df_chart['iv'].fillna(0).tolist()
@@ -2449,7 +2575,7 @@ def start_fetching():
                 "last_update": datetime.now().isoformat()
             }
             
-            print(f"✓ Stored {len(timestamps_for_chart)} data points in iv_data_store (latest 500 records)")
+            print(f"✓ Stored {len(timestamps_for_chart)} data points in iv_data_store (all records)")
             print(f"  Debug: iv_data_store keys after initial fetch: {list(iv_data_store.keys())}")
             print(f"  Debug: Symbol stored: {symbol}")
             print(f"  Debug: Data verification - timestamps: {len(timestamps_for_chart)}, IV values: {len(iv_values_for_chart)}")
@@ -2626,7 +2752,7 @@ def start_fetching():
             option_type=option_type
         )
         
-        # STEP 6: Store in iv_data_store for chart (latest 500 records)
+        # STEP 6: Store in iv_data_store for chart (all records)
         print("=" * 60)
         print("STEP 6: Preparing data for chart display...")
         print("=" * 60)
@@ -2637,7 +2763,7 @@ def start_fetching():
             df_with_iv['date'] = df_with_iv['date'].dt.tz_convert('Asia/Kolkata')
         
         df_with_iv = df_with_iv.sort_values('date')
-        df_chart = df_with_iv.tail(500) if len(df_with_iv) > 500 else df_with_iv
+        df_chart = df_with_iv  # Show all rows, no limit
         
         timestamps_for_chart = df_chart['date'].dt.strftime('%Y-%m-%dT%H:%M:%S+05:30').tolist()
         iv_values_for_chart = df_chart['iv'].fillna(0).tolist()
@@ -2685,16 +2811,10 @@ def start_fetching():
             fetch_lock.release()
             return jsonify({"success": False, "message": error_msg}), 500
         
-            # Release lock after thread is started successfully
-            fetch_lock.release()
-            
-            return jsonify({"success": True, "message": "Data fetching started"})
+        # Release lock after thread is started successfully
+        fetch_lock.release()
         
-        else:
-            # Invalid mode
-            fetch_lock.release()
-            print(f"[start_fetching] ERROR: Invalid mode '{mode}'. Valid modes: 'automatic', 'manual'")
-            return jsonify({"success": False, "message": f"Invalid mode '{mode}'. Must be 'automatic' or 'manual'."}), 400
+        return jsonify({"success": True, "message": "Data fetching started"})
     
     except Exception as e:
         # Ensure lock is always released on any exception
@@ -2793,9 +2913,9 @@ def get_iv_data():
                     else:
                         df['date'] = df['date'].dt.tz_convert('Asia/Kolkata')
                     
-                    # Sort by date and get latest 500 records for chart
+                    # Sort by date - show all records for chart
                     df = df.sort_values('date')
-                    df_chart = df.tail(500) if len(df) > 500 else df
+                    df_chart = df  # Show all rows, no limit
                     
                     timestamps = df_chart['date'].dt.strftime('%Y-%m-%dT%H:%M:%S+05:30').tolist()
                     iv_values = df_chart['iv'].fillna(0).tolist()
@@ -2811,7 +2931,7 @@ def get_iv_data():
                         "last_update": datetime.now().isoformat()
                     }
                     
-                    print(f"✓ Loaded {len(timestamps)} data points from CSV for {symbol} (latest 500 records)")
+                    print(f"✓ Loaded {len(timestamps)} data points from CSV for {symbol} (all records)")
                     print(f"  Debug: Stored in iv_data_store with key: {symbol}")
                     print(f"  Debug: iv_data_store now has keys: {list(iv_data_store.keys())}")
                     return jsonify({
@@ -2843,7 +2963,7 @@ def get_iv_data():
                                     else:
                                         df['date'] = df['date'].dt.tz_convert('Asia/Kolkata')
                                     df = df.sort_values('date')
-                                    df_chart = df.tail(500) if len(df) > 500 else df
+                                    df_chart = df  # Show all rows, no limit
                                     timestamps = df_chart['date'].dt.strftime('%Y-%m-%dT%H:%M:%S+05:30').tolist()
                                     iv_values = df_chart['iv'].fillna(0).tolist()
                                     close_prices = df_chart['close'].tolist() if 'close' in df_chart.columns else []

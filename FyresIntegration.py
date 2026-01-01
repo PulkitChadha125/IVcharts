@@ -359,18 +359,51 @@ def fetchOHLC_Weekly(symbol):
 #     return df_weekly  # Return last 20 weeks
 
 def fetchOHLC(symbol,tf):
+    # Ensure symbol is a string and strip any whitespace
+    symbol = str(symbol).strip() if symbol else None
+    if not symbol:
+        print(f"❌ ERROR: Invalid symbol provided to fetchOHLC: {symbol}")
+        return None
+    
+    # Debug: Print the symbol being sent to API
+    print(f"DEBUG fetchOHLC: Symbol received: '{symbol}' (type: {type(symbol)}, length: {len(symbol)})")
+    
     dat =str(datetime.now().date())
-    dat1 = str((datetime.now() - timedelta(17)).date())
+    dat1 = str((datetime.now() - timedelta(90)).date())
+    
+    # Ensure symbol is clean before creating data dict
+    clean_symbol = str(symbol).strip()
+    
+    # Debug: Verify symbol before creating data dict
+    print(f"DEBUG fetchOHLC: Clean symbol before data dict: '{clean_symbol}' (length: {len(clean_symbol)})")
+    
     data = {
-        "symbol": symbol,
+        "symbol": clean_symbol,  # Use the cleaned symbol
         "resolution":str(tf),
         "date_format": "1",
         "range_from": dat1,
         "range_to": dat,
         "cont_flag": "1"
     }
+
+    print("data: ",data)
+    
+    # Debug: Verify symbol in data dict after creation
+    data_symbol = str(data.get('symbol', '')).strip()
+    print(f"DEBUG fetchOHLC: Symbol in data dict: '{data_symbol}' (length: {len(data_symbol)})")
+    
+    # Verify the symbol is correct (should be exactly 24 characters for MCX:SILVERM26JAN233000CE)
+    if len(data_symbol) != 24:
+        print(f"⚠️ WARNING: Symbol length is {len(data_symbol)}, expected 24. Symbol: '{data_symbol}'")
     
     try:
+        # Store the original symbol for error reporting (use the cleaned one)
+        # Keep a local copy to avoid any variable modification issues
+        symbol_for_logging = str(clean_symbol).strip()
+        
+        # Debug: Final verification before API call
+        print(f"DEBUG fetchOHLC: About to call API with symbol: '{symbol_for_logging}'")
+        
         response = fyers.history(data=data)
         
         # Check response structure (minimal logging)
@@ -381,10 +414,16 @@ def fetchOHLC(symbol,tf):
                     print(f"⚠️ API Status: {status}")
             if 'candles' in response:
                 candle_count = len(response['candles']) if isinstance(response['candles'], list) else 0
-                print(f"✓ Fetched {candle_count} candles for {symbol}")
+                print(f"✓ Fetched {candle_count} candles for {symbol_for_logging}")
             else:
-                print(f"⚠️ WARNING: 'candles' key not found in response for {symbol}")
+                # Always use the stored symbol for error reporting to avoid corruption
+                print(f"⚠️ WARNING: 'candles' key not found in response for {symbol_for_logging}")
                 print(f"Response keys: {list(response.keys())}")
+                # Debug: Check if response contains symbol info
+                if 'message' in response:
+                    print(f"DEBUG fetchOHLC: API error message: {response.get('message')}")
+                if 'symbol' in response:
+                    print(f"DEBUG fetchOHLC: Response contains symbol: {response.get('symbol')}")
         else:
             print(f"⚠️ WARNING: Response is not a dict, type: {type(response)}")
         

@@ -177,14 +177,16 @@ class ChartUpdateManager {
         // Sort by time
         chartData.sort((a, b) => a.time - b.time);
         
-        // Limit to latest 500 records for chart display
-        const MAX_CHART_RECORDS = 500;
+        // Limit to latest records for chart display (read from UI)
+        const maxCandlesInput = document.getElementById('maxCandles');
+        const MAX_CHART_RECORDS = maxCandlesInput ? parseInt(maxCandlesInput.value) || 50000 : 50000;
+        
         if (chartData.length > MAX_CHART_RECORDS) {
-            // Keep only the latest 500 records
+            // Keep only the latest records
             const startIndex = chartData.length - MAX_CHART_RECORDS;
             chartData = chartData.slice(startIndex);
             
-            // Also update dataMap to only include the latest 500 records
+            // Also update dataMap to only include the latest records
             const latestTimes = new Set(chartData.map(d => d.time));
             const filteredDataMap = new Map();
             for (const [time, value] of dataMap.entries()) {
@@ -1404,6 +1406,12 @@ async function startFetching() {
         }
         
         console.log('Manual mode parameters:', payload);
+    }
+    
+    // Add max_candles from UI to payload
+    const maxCandlesInput = document.getElementById('maxCandles');
+    if (maxCandlesInput) {
+        payload.max_candles = parseInt(maxCandlesInput.value) || 50000;
     }
     
     console.log('Sending start_fetching request with payload:', payload);
