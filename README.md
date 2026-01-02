@@ -57,7 +57,7 @@ python main.py
 
 2. **Open your browser** and navigate to:
 ```
-http://localhost:5000
+http://localhost:3000
 ```
 
 3. **Login to Fyers API**:

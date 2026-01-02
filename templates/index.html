@@ -84,15 +84,19 @@
                                 <label for="symbol">Symbol</label>
                                 <input type="text" id="symbol" placeholder="e.g., NSE:NIFTY25N1825500CE" value="NSE:NIFTY25N1825500CE">
                             </div>
+                            <div class="input-group">
+                                <label for="manualFutureSymbol">Future Symbol <span style="color: #ff6b6b;">*</span></label>
+                                <select id="manualFutureSymbol" onchange="onManualFutureSymbolChange()">
+                                    <option value="">Loading symbols...</option>
+                                </select>
+                                <small style="color: #a0c4ff; display: block; margin-top: 4px;">Select future symbol from SymbolSetting.csv</small>
+                            </div>
                         </div>
                         <div class="settings-row">
                             <div class="input-group">
-                                <label for="strike">Strike Price (Optional)</label>
-                                <input type="number" id="strike" placeholder="e.g., 18257" step="0.01">
-                            </div>
-                            <div class="input-group">
-                                <label for="expiry">Expiry Date & Time (Optional)</label>
+                                <label for="expiry">Option Expiry Date</label>
                                 <input type="datetime-local" id="expiry">
+                                <small style="color: #a0c4ff; display: block; margin-top: 4px;">Auto-filled from SymbolSetting.csv</small>
                             </div>
                             <div class="input-group">
                                 <label for="optionType">Option Type (Optional)</label>
@@ -101,6 +105,14 @@
                                     <option value="c">Call (CE)</option>
                                     <option value="p">Put (PE)</option>
                                 </select>
+                            </div>
+                        </div>
+                        <div class="settings-row">
+                            <div class="info-box" style="background: #1e3a5f; padding: 10px; border-radius: 4px; margin-top: 10px;">
+                                <small style="color: #a0c4ff;">
+                                    <strong>Manual Mode:</strong> Enter option symbol, select future symbol from SymbolSetting.csv, 
+                                    provide strike price, and the system will fetch both option and future data to calculate IV.
+                                </small>
                             </div>
                         </div>
                     </div>

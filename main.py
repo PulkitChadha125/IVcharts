@@ -243,7 +243,7 @@ def load_credentials():
 def load_symbol_settings():
     """
     Load symbol settings from SymbolSetting.csv
-    Returns list of dicts with: prefix, symbol, expiry_date, strike_step
+    Returns list of dicts with: prefix, symbol, expiry_date, strike_step, option_expiry_date, option_expiry_time
     """
     symbols = []
     try:
@@ -255,11 +255,13 @@ def load_symbol_settings():
                     symbol = row.get('SYMBOL', '').strip()
                     expiry_str = row.get('EXPIERY', '').strip()
                     strike_step_str = row.get('StrikeStep', '').strip()
+                    option_expiry_str = row.get('OptionExpiery', '').strip()
+                    option_expiry_time_str = row.get('Time', '').strip()
                     
                     if not prefix or not symbol or not expiry_str:
                         continue
                     
-                    # Parse expiry date (format: DD-MM-YYYY)
+                    # Parse future expiry date (format: DD-MM-YYYY)
                     try:
                         expiry_date = datetime.strptime(expiry_str, '%d-%m-%Y')
                     except ValueError:
@@ -269,6 +271,34 @@ def load_symbol_settings():
                         except ValueError:
                             print(f"Could not parse expiry date: {expiry_str}")
                             continue
+                    
+                    # Parse option expiry date (format: DD-MM-YYYY)
+                    option_expiry_date = None
+                    option_expiry_datetime = None
+                    if option_expiry_str:
+                        try:
+                            option_expiry_date = datetime.strptime(option_expiry_str, '%d-%m-%Y')
+                            # Combine with time if provided
+                            if option_expiry_time_str:
+                                try:
+                                    # Parse time (format: HH:MM)
+                                    time_parts = option_expiry_time_str.split(':')
+                                    if len(time_parts) == 2:
+                                        hour = int(time_parts[0])
+                                        minute = int(time_parts[1])
+                                        option_expiry_datetime = option_expiry_date.replace(hour=hour, minute=minute)
+                                    else:
+                                        option_expiry_datetime = option_expiry_date
+                                except ValueError:
+                                    option_expiry_datetime = option_expiry_date
+                            else:
+                                option_expiry_datetime = option_expiry_date
+                        except ValueError:
+                            try:
+                                option_expiry_date = datetime.strptime(option_expiry_str, '%Y-%m-%d')
+                                option_expiry_datetime = option_expiry_date
+                            except ValueError:
+                                print(f"Could not parse option expiry date: {option_expiry_str}")
                     
                     # Parse strike step
                     strike_step = None
@@ -283,7 +313,11 @@ def load_symbol_settings():
                         'symbol': symbol,
                         'expiry_date': expiry_date,
                         'strike_step': strike_step,
-                        'expiry_str': expiry_str
+                        'expiry_str': expiry_str,
+                        'option_expiry_date': option_expiry_date,
+                        'option_expiry_datetime': option_expiry_datetime,
+                        'option_expiry_str': option_expiry_str,
+                        'option_expiry_time': option_expiry_time_str
                     })
                 except Exception as e:
                     print(f"Error parsing symbol row: {row}, Error: {e}")
@@ -294,7 +328,7 @@ def load_symbol_settings():
         print("SymbolSetting.csv not found. Creating default file...")
         # Create default file
         default_symbols = [
-            {'prefix': 'NSE', 'symbol': 'NIFTY', 'expiry_date': datetime(2025, 11, 25), 'strike_step': 50, 'expiry_str': '25-11-2025'}
+            {'prefix': 'NSE', 'symbol': 'NIFTY', 'expiry_date': datetime(2025, 11, 25), 'strike_step': 50, 'expiry_str': '25-11-2025', 'option_expiry_date': None, 'option_expiry_datetime': None, 'option_expiry_str': '', 'option_expiry_time': ''}
         ]
         return default_symbols
     except Exception as e:
@@ -1907,7 +1941,7 @@ def fetch_data_loop_automatic(future_symbol, expiry_date, expiry_type, option_ty
             print(f"  Waiting 5 seconds before retrying...")
             time.sleep(5)  # Wait before retrying on error
 
-def fetch_data_loop(symbol, timeframe, manual_strike=None, manual_expiry=None, manual_option_type=None, risk_free_rate=0.07):
+def fetch_data_loop(symbol, timeframe, manual_strike=None, manual_expiry=None, manual_option_type=None, manual_future_symbol=None, risk_free_rate=0.07):
     """
     Continuously fetch historical data and calculate IV
     Only fetches data during market hours (NSE: 9:15-15:30, MCX: 9:00-23:30)
@@ -1948,40 +1982,13 @@ def fetch_data_loop(symbol, timeframe, manual_strike=None, manual_expiry=None, m
             
             if df is not None and len(df) > 0:
                 try:
-                    # Extract future symbol from option symbol for IV calculation (same as automatic mode)
-                    # This ensures we use the correct future symbol for IV calculation
-                    manual_future_symbol_loop = None
-                    if symbol:
-                        # Parse option symbol to get underlying and expiry
-                        option_info = parse_option_symbol(symbol)
-                        if option_info and option_info.get('underlying'):
-                            underlying = option_info['underlying']
-                            expiry_date = None
-                            
-                            # Use manual_expiry if provided, otherwise use parsed expiry
-                            if manual_expiry:
-                                try:
-                                    if isinstance(manual_expiry, str):
-                                        try:
-                                            expiry_date = datetime.strptime(manual_expiry, '%Y-%m-%dT%H:%M')
-                                        except:
-                                            expiry_date = datetime.fromisoformat(manual_expiry.replace('Z', '+00:00'))
-                                            if expiry_date.tzinfo:
-                                                expiry_date = expiry_date.replace(tzinfo=None)
-                                except Exception as e:
-                                    print(f"Warning: Could not parse manual_expiry: {e}")
-                            
-                            if not expiry_date and option_info.get('expiry_date'):
-                                expiry_date = option_info['expiry_date']
-                            
-                            if expiry_date:
-                                # Construct future symbol using same logic as automatic mode
-                                manual_future_symbol_loop = get_future_symbol(underlying, expiry_date)
-                                if manual_future_symbol_loop:
-                                    print(f"Extracted future symbol for IV calculation: {manual_future_symbol_loop}")
+                    # Use the future symbol provided from SymbolSetting.csv (selected by user in manual mode)
+                    # No need to construct it - it's already provided
+                    if manual_future_symbol:
+                        print(f"Using future symbol from SymbolSetting.csv: {manual_future_symbol}")
                     
                     # Calculate IV (will use py_vollib Black model for options, historical volatility for underlying)
-                    # Use same formula as automatic mode by passing manual_future_symbol
+                    # Use the future symbol provided by user (from SymbolSetting.csv dropdown)
                     df_with_iv = calculate_iv(
                         df.copy(), 
                         window=20, 
@@ -1991,7 +1998,7 @@ def fetch_data_loop(symbol, timeframe, manual_strike=None, manual_expiry=None, m
                         manual_strike=manual_strike,
                         manual_expiry=manual_expiry,
                         manual_option_type=manual_option_type,
-                        manual_future_symbol=manual_future_symbol_loop  # Use same formula as automatic mode
+                        manual_future_symbol=manual_future_symbol  # Use the future symbol selected by user from dropdown
                     )
                     
                     if df_with_iv is not None and 'iv' in df_with_iv.columns:
@@ -2298,26 +2305,39 @@ def start_fetching():
             
             print(f"[start_fetching] Automatic mode params: future_symbol={future_symbol}, expiry_date={expiry_date_str}, expiry_type={expiry_type}, option_type={option_type}")
             
-            if not future_symbol or not expiry_date_str:
+            if not future_symbol:
                 fetch_lock.release()
-                return jsonify({"success": False, "message": "Future symbol and option expiry date are required for automatic mode"}), 400
+                return jsonify({"success": False, "message": "Future symbol is required for automatic mode"}), 400
             
             # Validate that future_symbol is correctly formatted (should come from SymbolSetting.csv)
             if ':' not in future_symbol or 'FUT' not in future_symbol:
                 fetch_lock.release()
                 return jsonify({"success": False, "message": f"Invalid future symbol format: {future_symbol}. Should be like MCX:SILVER25DECFUT"}), 400
             
-            try:
-                # Parse OPTION expiry date (from web input, not from SymbolSetting.csv)
-                option_expiry_date = datetime.strptime(expiry_date_str, '%Y-%m-%d')
-            except:
+            # Get option expiry from SymbolSetting.csv based on selected future symbol
+            option_expiry_date = None
+            if expiry_date_str:
+                # Use provided expiry date (from auto-filled input)
                 try:
-                    option_expiry_date = datetime.fromisoformat(expiry_date_str.replace('Z', '+00:00'))
-                    if option_expiry_date.tzinfo:
-                        option_expiry_date = option_expiry_date.replace(tzinfo=None)
+                    option_expiry_date = datetime.strptime(expiry_date_str, '%Y-%m-%d')
                 except:
-                    fetch_lock.release()
-                    return jsonify({"success": False, "message": "Invalid option expiry date format"}), 400
+                    try:
+                        option_expiry_date = datetime.strptime(expiry_date_str, '%Y-%m-%dT%H:%M')
+                    except:
+                        pass
+            else:
+                # Look up option expiry from SymbolSetting.csv
+                symbols = load_symbol_settings()
+                for sym in symbols:
+                    sym_future = generate_future_symbol_from_settings(sym['prefix'], sym['symbol'], sym['expiry_date'])
+                    if sym_future == future_symbol and sym.get('option_expiry_datetime'):
+                        option_expiry_date = sym['option_expiry_datetime']
+                        print(f"Using option expiry from SymbolSetting.csv: {option_expiry_date}")
+                        break
+            
+            if not option_expiry_date:
+                fetch_lock.release()
+                return jsonify({"success": False, "message": "Option expiry date is required. Please ensure SymbolSetting.csv has OptionExpiery field."}), 400
             
             # Extract underlying from future symbol (e.g., "NSE:NIFTY25NOVFUT" -> "NIFTY", "MCX:CRUDEOILM" -> "CRUDEOIL")
             if ':' in future_symbol:
@@ -2644,17 +2664,37 @@ def start_fetching():
         
         elif mode == 'manual':
             print("[start_fetching] Processing MANUAL mode")
-        # Manual mode: Use provided symbol
-        symbol = data.get('symbol')
-        strike = data.get('strike')  # Optional manual strike
-        expiry = data.get('expiry')  # Optional manual expiry (datetime string)
-        option_type = data.get('option_type')  # Optional manual option type ('c' or 'p')
-        
-        print(f"[start_fetching] Manual mode params: symbol={symbol}")
-        
-        if not symbol:
-            fetch_lock.release()
-            return jsonify({"success": False, "message": "Symbol is required for manual mode"}), 400
+            # Manual mode: Use provided symbol, future symbol, and option expiry from CSV
+            symbol = data.get('symbol')
+            future_symbol = data.get('future_symbol')  # Future symbol from SymbolSetting.csv dropdown
+            expiry = data.get('expiry')  # Option expiry from SymbolSetting.csv (auto-filled)
+            option_type = data.get('option_type')  # Optional manual option type ('c' or 'p')
+            
+            print(f"[start_fetching] Manual mode params: symbol={symbol}, future_symbol={future_symbol}, expiry={expiry}")
+            
+            if not symbol:
+                fetch_lock.release()
+                return jsonify({"success": False, "message": "Symbol is required for manual mode"}), 400
+            
+            if not future_symbol:
+                fetch_lock.release()
+                return jsonify({"success": False, "message": "Future symbol is required for manual mode. Please select from the dropdown."}), 400
+            
+            # Validate that future_symbol is correctly formatted
+            if ':' not in future_symbol or 'FUT' not in future_symbol:
+                fetch_lock.release()
+                return jsonify({"success": False, "message": f"Invalid future symbol format: {future_symbol}. Should be like MCX:SILVERM26FEBFUT"}), 400
+            
+            # Get option expiry from SymbolSetting.csv based on selected future symbol
+            if not expiry:
+                # Look up option expiry from SymbolSetting.csv
+                symbols = load_symbol_settings()
+                for sym in symbols:
+                    sym_future = generate_future_symbol_from_settings(sym['prefix'], sym['symbol'], sym['expiry_date'])
+                    if sym_future == future_symbol and sym.get('option_expiry_datetime'):
+                        expiry = sym['option_expiry_datetime'].strftime('%Y-%m-%dT%H:%M')
+                        print(f"Using option expiry from SymbolSetting.csv: {expiry}")
+                        break
         
         # STEP 3: Fetch historical data
         print("=" * 60)
@@ -2675,40 +2715,9 @@ def start_fetching():
         print("STEP 4: Calculating IV...")
         print("=" * 60)
         
-        # Extract future symbol from option symbol for IV calculation (same as automatic mode)
-        # This ensures we use the correct future symbol for IV calculation
-        manual_future_symbol = None
-        if symbol:
-            # Parse option symbol to get underlying and expiry
-            option_info = parse_option_symbol(symbol)
-            if option_info and option_info.get('underlying') and option_info.get('expiry_date'):
-                underlying = option_info['underlying']
-                expiry_date = option_info['expiry_date']
-                # Construct future symbol using same logic as automatic mode
-                manual_future_symbol = get_future_symbol(underlying, expiry_date)
-                if manual_future_symbol:
-                    print(f"Extracted future symbol from option symbol: {manual_future_symbol}")
-                else:
-                    print(f"Warning: Could not construct future symbol from option symbol {symbol}")
-            elif expiry:
-                # If manual expiry provided, try to parse symbol and use expiry
-                option_info = parse_option_symbol(symbol)
-                if option_info and option_info.get('underlying'):
-                    underlying = option_info['underlying']
-                    try:
-                        # Parse expiry datetime
-                        if isinstance(expiry, str):
-                            try:
-                                expiry_date = datetime.strptime(expiry, '%Y-%m-%dT%H:%M')
-                            except:
-                                expiry_date = datetime.fromisoformat(expiry.replace('Z', '+00:00'))
-                                if expiry_date.tzinfo:
-                                    expiry_date = expiry_date.replace(tzinfo=None)
-                            manual_future_symbol = get_future_symbol(underlying, expiry_date)
-                            if manual_future_symbol:
-                                print(f"Constructed future symbol from underlying and expiry: {manual_future_symbol}")
-                    except Exception as e:
-                        print(f"Warning: Could not parse expiry for future symbol construction: {e}")
+        # Use the future symbol directly from SymbolSetting.csv (selected by user)
+        # No need to construct it - user has selected it from the dropdown
+        print(f"Using future symbol from SymbolSetting.csv: {future_symbol}")
         
         try:
             df_with_iv = calculate_iv(
@@ -2717,10 +2726,10 @@ def start_fetching():
                 timeframe=timeframe,
                 symbol=symbol,
                 risk_free_rate=risk_free_rate,
-                manual_strike=strike,
+                manual_strike=None,  # Strike is extracted from symbol, no need for manual input
                 manual_expiry=expiry,
                 manual_option_type=option_type,
-                manual_future_symbol=manual_future_symbol  # Use same formula as automatic mode
+                manual_future_symbol=future_symbol  # Use the future symbol selected by user from dropdown
             )
             
             if df_with_iv is None or 'iv' not in df_with_iv.columns:
@@ -2743,11 +2752,17 @@ def start_fetching():
         print("STEP 5: Saving to CSV...")
         print("=" * 60)
         
+        # Extract strike from symbol if available
+        strike_from_symbol = None
+        option_info = parse_option_symbol(symbol)
+        if option_info and option_info.get('strike'):
+            strike_from_symbol = option_info['strike']
+        
         save_iv_to_csv(
             symbol=symbol,
             df_with_iv=df_with_iv,
             timeframe=timeframe,
-            strike=strike,
+            strike=strike_from_symbol,
             expiry=expiry,
             option_type=option_type
         )
@@ -2791,14 +2806,14 @@ def start_fetching():
             "symbol": symbol,
             "timeframe": timeframe,
             "mode": "manual",
-            "strike": strike,
             "expiry": expiry,
-            "option_type": option_type
+            "option_type": option_type,
+            "future_symbol": future_symbol  # Store future symbol for reference
         })
         
         # Start fetching in background thread
         try:
-            fetch_thread = threading.Thread(target=fetch_data_loop, args=(symbol, timeframe, strike, expiry, option_type, risk_free_rate), daemon=True)
+            fetch_thread = threading.Thread(target=fetch_data_loop, args=(symbol, timeframe, None, expiry, option_type, future_symbol, risk_free_rate), daemon=True)
             fetch_thread.start()
             print(f"Manual fetch thread started successfully. Thread ID: {fetch_thread.ident}")
         except Exception as e:
@@ -3108,13 +3123,23 @@ def get_symbol_settings():
                 sym['expiry_date']
             )
             if future_symbol:
+                # Format option expiry datetime for datetime-local input (YYYY-MM-DDTHH:mm)
+                option_expiry_datetime_str = None
+                if sym.get('option_expiry_datetime'):
+                    option_expiry_datetime_str = sym['option_expiry_datetime'].strftime('%Y-%m-%dT%H:%M')
+                elif sym.get('option_expiry_date'):
+                    option_expiry_datetime_str = sym['option_expiry_date'].strftime('%Y-%m-%dT%H:%M')
+                
                 symbol_list.append({
                     'future_symbol': future_symbol,
                     'prefix': sym['prefix'],
                     'symbol': sym['symbol'],
                     'expiry_date': sym['expiry_date'].strftime('%Y-%m-%d'),
                     'expiry_str': sym['expiry_str'],
-                    'strike_step': sym['strike_step']
+                    'strike_step': sym['strike_step'],
+                    'option_expiry_date': sym['option_expiry_date'].strftime('%Y-%m-%d') if sym.get('option_expiry_date') else None,
+                    'option_expiry_datetime': option_expiry_datetime_str,
+                    'option_expiry_time': sym.get('option_expiry_time', '')
                 })
                 print(f"[get_symbol_settings] Generated: {sym['prefix']}:{sym['symbol']} -> {future_symbol}")
             else:
@@ -3361,10 +3386,10 @@ if __name__ == '__main__':
         time.sleep(1.5)  # Wait for server to start
         try:
             # Open in default system browser
-            webbrowser.open('http://127.0.0.1:5000')
+            webbrowser.open('http://127.0.0.1:3000')
         except Exception as e:
             print(f"Could not open browser automatically: {e}")
-            print("Please manually open: http://127.0.0.1:5000")
+            print("Please manually open: http://127.0.0.1:3000")
     
     # Start browser in a separate thread
     browser_thread = threading.Thread(target=open_browser)
@@ -3374,7 +3399,7 @@ if __name__ == '__main__':
     print("\n" + "="*60)
     print("IV Charts Web Application")
     print("="*60)
-    print(f"Server starting on http://127.0.0.1:5000")
+    print(f"Server starting on http://127.0.0.1:3000")
     print(f"Opening in your default browser...")
     print("\nTo disable Cursor's auto-preview:")
     print("1. Go to Cursor Settings (Ctrl+,)")
@@ -3384,5 +3409,5 @@ if __name__ == '__main__':
     
     # Run with use_reloader=False to prevent multiple browser opens
     # and to reduce Cursor's auto-detection
-    app.run(debug=True, host='127.0.0.1', port=5000, use_reloader=False)
+    app.run(debug=True, host='127.0.0.1', port=3000, use_reloader=False)
 

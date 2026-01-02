@@ -1166,39 +1166,59 @@ async function loadSymbolSettings() {
     }
 }
 
-// Populate future symbol dropdown
+// Populate future symbol dropdown (for both automatic and manual modes)
 function populateFutureSymbolDropdown(symbols) {
+    // Populate automatic mode dropdown
     const dropdown = document.getElementById('futureSymbol');
-    if (!dropdown) {
-        console.error('Future symbol dropdown not found');
-        return;
+    if (dropdown) {
+        dropdown.innerHTML = '<option value="">Select Future Symbol</option>';
+        
+        console.log(`[populateFutureSymbolDropdown] Loading ${symbols.length} symbols into automatic mode dropdown`);
+        
+        symbols.forEach((sym, index) => {
+            const option = document.createElement('option');
+            option.value = sym.future_symbol;
+            option.textContent = sym.future_symbol;
+            option.dataset.strikeStep = sym.strike_step || '';
+            option.dataset.expiryDate = sym.expiry_date || '';
+            option.dataset.originalSymbol = sym.symbol || ''; // Store original symbol for debugging
+            option.dataset.optionExpiryDatetime = sym.option_expiry_datetime || '';
+            dropdown.appendChild(option);
+            console.log(`[populateFutureSymbolDropdown] Added option ${index + 1}: ${sym.future_symbol} (original: ${sym.symbol})`);
+        });
+        
+        console.log(`[populateFutureSymbolDropdown] Total options in automatic dropdown: ${dropdown.options.length}`);
+        
+        // Select first option if available
+        if (symbols.length > 0) {
+            dropdown.value = symbols[0].future_symbol;
+            onFutureSymbolChange();
+        }
     }
     
-    dropdown.innerHTML = '<option value="">Select Future Symbol</option>';
-    
-    console.log(`[populateFutureSymbolDropdown] Loading ${symbols.length} symbols into dropdown`);
-    
-    symbols.forEach((sym, index) => {
-        const option = document.createElement('option');
-        option.value = sym.future_symbol;
-        option.textContent = sym.future_symbol;
-        option.dataset.strikeStep = sym.strike_step || '';
-        option.dataset.expiryDate = sym.expiry_date || '';
-        option.dataset.originalSymbol = sym.symbol || ''; // Store original symbol for debugging
-        dropdown.appendChild(option);
-        console.log(`[populateFutureSymbolDropdown] Added option ${index + 1}: ${sym.future_symbol} (original: ${sym.symbol})`);
-    });
-    
-    console.log(`[populateFutureSymbolDropdown] Total options in dropdown: ${dropdown.options.length}`);
-    
-    // Select first option if available
-    if (symbols.length > 0) {
-        dropdown.value = symbols[0].future_symbol;
-        onFutureSymbolChange();
+    // Populate manual mode dropdown
+    const manualDropdown = document.getElementById('manualFutureSymbol');
+    if (manualDropdown) {
+        manualDropdown.innerHTML = '<option value="">Select Future Symbol</option>';
+        
+        console.log(`[populateFutureSymbolDropdown] Loading ${symbols.length} symbols into manual mode dropdown`);
+        
+        symbols.forEach((sym, index) => {
+            const option = document.createElement('option');
+            option.value = sym.future_symbol;
+            option.textContent = sym.future_symbol;
+            option.dataset.strikeStep = sym.strike_step || '';
+            option.dataset.expiryDate = sym.expiry_date || '';
+            option.dataset.originalSymbol = sym.symbol || '';
+            option.dataset.optionExpiryDatetime = sym.option_expiry_datetime || '';
+            manualDropdown.appendChild(option);
+        });
+        
+        console.log(`[populateFutureSymbolDropdown] Total options in manual dropdown: ${manualDropdown.options.length}`);
     }
 }
 
-// Handle future symbol change
+// Handle future symbol change (for automatic mode)
 function onFutureSymbolChange() {
     const dropdown = document.getElementById('futureSymbol');
     const selectedOption = dropdown.options[dropdown.selectedIndex];
@@ -1213,11 +1233,36 @@ function onFutureSymbolChange() {
             strikeStepInput.value = '';
         }
         
-        // Auto-fill expiry date
-        const expiryDate = selectedOption.dataset.expiryDate;
+        // Auto-fill option expiry date/time from SymbolSetting.csv
+        const optionExpiryDatetime = selectedOption.dataset.optionExpiryDatetime;
         const expiryDateInput = document.getElementById('autoExpiryDate');
-        if (expiryDate && expiryDate !== '') {
-            expiryDateInput.value = expiryDate;
+        if (optionExpiryDatetime && optionExpiryDatetime !== '') {
+            // Extract date part (YYYY-MM-DD) from datetime-local format
+            const datePart = optionExpiryDatetime.split('T')[0];
+            expiryDateInput.value = datePart;
+        } else {
+            // Fallback to future expiry date if option expiry not available
+            const expiryDate = selectedOption.dataset.expiryDate;
+            if (expiryDate && expiryDate !== '') {
+                expiryDateInput.value = expiryDate;
+            }
+        }
+    }
+}
+
+// Handle manual future symbol change
+function onManualFutureSymbolChange() {
+    const dropdown = document.getElementById('manualFutureSymbol');
+    const selectedOption = dropdown.options[dropdown.selectedIndex];
+    
+    if (selectedOption && selectedOption.dataset) {
+        // Auto-fill option expiry date/time from SymbolSetting.csv
+        const optionExpiryDatetime = selectedOption.dataset.optionExpiryDatetime;
+        const expiryInput = document.getElementById('expiry');
+        if (optionExpiryDatetime && optionExpiryDatetime !== '') {
+            expiryInput.value = optionExpiryDatetime;
+        } else {
+            expiryInput.value = '';
         }
     }
 }
@@ -1310,6 +1355,7 @@ function escapeHtml(text) {
 // Make functions available globally
 window.toggleMode = toggleMode;
 window.onFutureSymbolChange = onFutureSymbolChange;
+window.onManualFutureSymbolChange = onManualFutureSymbolChange;
 window.loadLogs = loadLogs;
 window.clearLogs = clearLogs;
 
@@ -1374,9 +1420,9 @@ async function startFetching() {
         
         console.log('Automatic mode parameters:', payload);
     } else {
-        // Manual mode: Get symbol and optional parameters
+        // Manual mode: Get symbol, future symbol, and optional parameters
         const symbolInput = document.getElementById('symbol');
-        const strikeInput = document.getElementById('strike');
+        const manualFutureSymbolInput = document.getElementById('manualFutureSymbol');
         const expiryInput = document.getElementById('expiry');
         const optionTypeInput = document.getElementById('optionType');
         
@@ -1392,15 +1438,21 @@ async function startFetching() {
             return;
         }
         
-        payload.symbol = symbol;
-        
-        // Add optional parameters if provided
-        if (strikeInput && strikeInput.value) {
-            payload.strike = parseFloat(strikeInput.value);
+        // Validate future symbol is selected
+        if (!manualFutureSymbolInput || !manualFutureSymbolInput.value) {
+            showNotification('Please select a future symbol from the dropdown', 'error');
+            return;
         }
+        
+        payload.symbol = symbol;
+        payload.future_symbol = manualFutureSymbolInput.value.trim();
+        
+        // Get option expiry from input (auto-filled from SymbolSetting.csv)
         if (expiryInput && expiryInput.value) {
             payload.expiry = expiryInput.value;
         }
+        
+        // Add optional parameters if provided
         if (optionTypeInput && optionTypeInput.value) {
             payload.option_type = optionTypeInput.value;
         }
